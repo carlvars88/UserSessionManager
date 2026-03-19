@@ -1,11 +1,13 @@
-// MARK: - Providers/FirebaseIdentityProvider.swift
+// MARK: - FirebaseProviders.swift
 //
-// Three Firebase adapters demonstrating all three token shapes.
-// Only this file imports FirebaseAuth — the rest of the app never does.
+// Example Firebase adapters demonstrating all three token shapes.
+// Only this file would import FirebaseAuth — the rest of the app never does.
+//
+// These are reference implementations with the Firebase calls commented out.
+// Uncomment and add the FirebaseAuth dependency to use in production.
 
 import Foundation
-@testable import SessionManager
-// import FirebaseAuth
+import SessionManager
 
 // MARK: - FirebaseEmailProvider  (BearerToken — Firebase ID token is a JWT)
 
@@ -22,7 +24,7 @@ public final class FirebaseEmailProvider: IdentityProvider, @unchecked Sendable 
         // let result = try await Auth.auth().signIn(withEmail: credential.email,
         //                                           password: credential.password)
         // return AuthResult(user: map(result.user), token: try await bearerToken(result.user))
-        throw SessionError.providerError("FirebaseAuth not linked.")
+        throw SessionError.providerError("FirebaseAuth not linked — uncomment the implementation above.")
     }
 
     public func refreshToken(_ token: BearerToken) async throws -> AuthResult<BearerToken> {
@@ -30,7 +32,7 @@ public final class FirebaseEmailProvider: IdentityProvider, @unchecked Sendable 
         // let idToken = try await user.getIDTokenForcingRefresh(true)
         // return AuthResult(user: map(user), token: BearerToken(accessToken: idToken,
         //                                                        expiresAt: Date.now.addingTimeInterval(3600)))
-        throw SessionError.providerError("FirebaseAuth not linked.")
+        throw SessionError.providerError("FirebaseAuth not linked — uncomment the implementation above.")
     }
 
     public func signOut(token: BearerToken) async throws {
@@ -73,7 +75,7 @@ public final class CustomBackendProvider: IdentityProvider, @unchecked Sendable 
         // let user       = SessionUser(id: response.userID, displayName: response.name,
         //                              email: credential.email)
         // return AuthResult(user: user, token: token)
-        throw SessionError.providerError("CustomBackend not configured.")
+        throw SessionError.providerError("CustomBackend not configured — uncomment the implementation above.")
     }
 
     // No refresh — opaque tokens are single-use until expiry
@@ -104,21 +106,18 @@ public final class CookieSessionProvider: IdentityProvider, @unchecked Sendable 
     public func signIn(with credential: EmailPasswordCredential) async throws -> AuthResult<CookieToken> {
         // POST /auth/login — server responds with Set-Cookie: session_id=...
         // URLSession stores the cookie automatically in HTTPCookieStorage.shared
-        // We just need to record that a session exists.
         //
         // let (_, response) = try await URLSession.shared.data(for: loginRequest(credential))
         // guard (response as? HTTPURLResponse)?.statusCode == 200 else {
         //     throw SessionError.invalidCredentials
         // }
-        // // Read expiry from the cookie if available
         // let expiry = HTTPCookieStorage.shared.cookies?.first(where: { $0.name == "session_id" })?.expiresDate
         // let token  = CookieToken(cookieName: "session_id", expiresAt: expiry)
         // let user   = try await fetchCurrentUser()   // GET /me
         // return AuthResult(user: user, token: token)
-        throw SessionError.providerError("CookieSessionProvider not configured.")
+        throw SessionError.providerError("CookieSessionProvider not configured — uncomment the implementation above.")
     }
 
-    // Re-validate with the server — if cookie is still valid, return a fresh signal
     public func refreshToken(_ token: CookieToken) async throws -> AuthResult<CookieToken> {
         // GET /auth/refresh — server validates the cookie and returns updated user info
         // let (data, response) = try await URLSession.shared.data(for: refreshRequest())
@@ -127,7 +126,7 @@ public final class CookieSessionProvider: IdentityProvider, @unchecked Sendable 
         // }
         // let user = try JSONDecoder().decode(SessionUser.self, from: data)
         // return AuthResult(user: user, token: token)   // cookie unchanged
-        throw SessionError.providerError("CookieSessionProvider not configured.")
+        throw SessionError.providerError("CookieSessionProvider not configured — uncomment the implementation above.")
     }
 
     public func signOut(token: CookieToken) async throws {

@@ -10,16 +10,19 @@ let package = Package(
         .iOS(.v16)
     ],
     products: [
-        // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
             name: "SessionManager",
             targets: ["SessionManager"]),
+        .library(
+            name: "SessionManagerExamples",
+            targets: ["SessionManagerExamples"]),
     ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "SessionManager"),
+        .target(
+            name: "SessionManagerExamples",
+            dependencies: ["SessionManager"]),
         .testTarget(
             name: "SessionManagerTests",
             dependencies: ["SessionManager"]
