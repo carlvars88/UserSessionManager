@@ -14,14 +14,14 @@ let package = Package(
             name: "SessionManager",
             targets: ["SessionManager"]),
         .library(
-            name: "SessionManagerExamples",
-            targets: ["SessionManagerExamples"]),
+            name: "IdentityProviders",
+            targets: ["IdentityProviders"]),
     ],
     targets: [
         .target(
             name: "SessionManager"),
         .target(
-            name: "SessionManagerExamples",
+            name: "IdentityProviders",
             dependencies: ["SessionManager"]),
         .testTarget(
             name: "SessionManagerTests",
