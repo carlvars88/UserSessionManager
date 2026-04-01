@@ -128,21 +128,78 @@ struct ContentView: View {
 
 ### 4. Inject into your networking layer
 
+The networking layer depends on **`SessionTokenProviding`**, not on the concrete manager type. Calling `currentValidToken()` always returns a ready-to-use token — if the token is expired or within the proactive refresh window, the engine refreshes it silently before returning. The networking layer never manages token lifecycle itself.
+
+#### Option A — typed (`SessionTokenProviding`)
+
+Use when your `APIClient` is in the same module as `SessionManager` and already knows the token type. You get the full typed token and can read any field:
+
 ```swift
 struct APIClient {
+    // Typed to BearerToken — knows the token shape
+    let tokens: any SessionTokenProviding<BearerToken>
+
+    func request(_ url: URL) async throws -> Data {
+        let token = try await tokens.currentValidToken()
+        // token is a BearerToken — access any field directly
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        return try await URLSession.shared.data(for: req).0
+    }
+}
+
+// Wiring — pass the session manager directly; it conforms to SessionTokenProviding
+let client = APIClient(tokens: session)
+```
+
+#### Option B — type-erased (`AnyTokenProvider`)
+
+Use when `APIClient` lives in a separate module with no dependency on `SessionManager`. `AnyTokenProvider` hides the token type behind a single `currentRawToken() -> String?` accessor:
+
+```swift
+struct APIClient {
+    // No SessionManager import required in this module
     let tokens: AnyTokenProvider
 
     func request(_ url: URL) async throws -> Data {
         var req = URLRequest(url: url)
-        if let token = try await tokens.currentRawToken() {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let value = try await tokens.currentRawToken() {
+            req.setValue("Bearer \(value)", forHTTPHeaderField: "Authorization")
         }
         return try await URLSession.shared.data(for: req).0
     }
 }
 
-// Wiring
+// Wiring — convenience init extracts accessToken automatically for BearerToken
 let client = APIClient(tokens: AnyTokenProvider(session))
+
+// Custom extraction for any other token shape
+let client = APIClient(tokens: AnyTokenProvider(session) { token in token.customField })
+```
+
+`currentRawToken()` returns `nil` for `CookieToken` sessions — cookies are handled automatically by `URLSession`, no header injection needed.
+
+#### Error handling
+
+Both `currentValidToken()` and `currentRawToken()` throw when no valid token can be obtained. Handle these at the request level to drive your UI:
+
+```swift
+func request(_ url: URL) async throws -> Data {
+    do {
+        let token = try await tokens.currentValidToken()
+        // … build and send request
+    } catch SessionError.sessionExpired {
+        // Refresh token permanently rejected — user must sign in again.
+        // Post a notification or route to the sign-in screen.
+        throw SessionError.sessionExpired
+    } catch SessionError.sessionNotFound {
+        // No active session — request was made before sign-in.
+        throw SessionError.sessionNotFound
+    } catch SessionError.tokenRefreshFailed {
+        // Transient refresh failure (network, timeout). Retry or surface the error.
+        throw SessionError.tokenRefreshFailed
+    }
+}
 ```
 
 ---
