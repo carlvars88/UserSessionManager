@@ -1,6 +1,7 @@
 // MARK: - OAuth2Provider.swift
 //
-// A standard OAuth2 Authorization Code + PKCE identity provider.
+// A standard OAuth2 Authorization Code + PKCE identity provider
+// built on plain URLSession — no external dependencies.
 //
 // Works with any RFC 6749 / RFC 7636 compliant authorization server
 // (Auth0, Okta, Keycloak, Azure AD, custom servers, etc.).
@@ -9,10 +10,10 @@
 //
 //   let provider = OAuth2Provider(
 //       configuration: .init(
-//           clientID:             "your-client-id",
-//           tokenEndpoint:        URL(string: "https://auth.example.com/oauth/token")!,
-//           revocationEndpoint:   URL(string: "https://auth.example.com/oauth/revoke")!,
-//           userInfoEndpoint:     URL(string: "https://auth.example.com/userinfo")!
+//           clientID:           "your-client-id",
+//           tokenEndpoint:      URL(string: "https://auth.example.com/oauth/token")!,
+//           revocationEndpoint: URL(string: "https://auth.example.com/oauth/revoke")!,
+//           userInfoEndpoint:   URL(string: "https://auth.example.com/userinfo")!
 //       )
 //   )
 //
@@ -27,14 +28,32 @@
 //
 //   let credential = OAuthCredential(
 //       provider:    "my-server",
-//       idToken:     authorizationCode,       // the code, not a JWT
+//       idToken:     authorizationCode,   // the code, not a JWT
 //       accessToken: nil,
-//       nonce:       codeVerifier             // PKCE code_verifier
+//       nonce:       codeVerifier         // PKCE code_verifier
 //   )
 //   await session.signIn(with: credential)
 
 import Foundation
 import SessionManager
+
+// MARK: - Private response shapes
+
+private struct OAuth2TokenResponse: Decodable {
+    let access_token:  String
+    let refresh_token: String?
+    let token_type:    String?
+    let expires_in:    Int?
+    let scope:         String?
+}
+
+private struct OAuth2UserInfoResponse: Decodable {
+    let sub:                String?
+    let name:               String?
+    let preferred_username: String?
+    let email:              String?
+    let picture:            String?
+}
 
 // MARK: - OAuth2Configuration
 
@@ -50,22 +69,22 @@ public struct OAuth2Configuration: Sendable {
     public let revocationEndpoint: URL?
 
     /// UserInfo endpoint (OpenID Connect). Used to fetch user profile after token exchange.
-    /// Set nil to extract user info from the ID token JWT instead.
+    /// Set nil to return a minimal user without fetching profile data.
     public let userInfoEndpoint: URL?
 
     /// Redirect URI registered with the authorization server.
     public let redirectURI: String
 
-    /// Additional scopes to request. "openid" and "profile" are always included.
+    /// Additional scopes to request.
     public let additionalScopes: [String]
 
     public init(
-        clientID: String,
-        tokenEndpoint: URL,
-        revocationEndpoint: URL? = nil,
-        userInfoEndpoint: URL? = nil,
-        redirectURI: String = "",
-        additionalScopes: [String] = []
+        clientID:           String,
+        tokenEndpoint:      URL,
+        revocationEndpoint: URL?    = nil,
+        userInfoEndpoint:   URL?    = nil,
+        redirectURI:        String  = "",
+        additionalScopes:   [String] = []
     ) {
         self.clientID           = clientID
         self.tokenEndpoint      = tokenEndpoint
@@ -91,24 +110,24 @@ public struct OAuth2Configuration: Sendable {
 ///   - `refreshToken` → the OAuth2 refresh token (if granted)
 ///   - `expiresAt`    → computed from `expires_in`
 ///   - `scopes`       → granted scopes
-public final class OAuth2Provider: IdentityProvider, @unchecked Sendable {
+public final class OAuth2Provider: IdentityProvider, Sendable {
 
     public typealias Credential = OAuthCredential
     public typealias Token      = BearerToken
 
     public let providerID: String
 
-    private let config: OAuth2Configuration
-    private let session: URLSession
+    private let config:     OAuth2Configuration
+    private let urlSession: URLSession
 
     public init(
         configuration: OAuth2Configuration,
-        providerID: String = "oauth2",
-        session: URLSession = .shared
+        providerID:    String     = "oauth2",
+        session:       URLSession = .shared
     ) {
         self.config     = configuration
         self.providerID = providerID
-        self.session    = session
+        self.urlSession = session
     }
 
     // MARK: - Sign In (Authorization Code → Token Exchange)
@@ -118,171 +137,155 @@ public final class OAuth2Provider: IdentityProvider, @unchecked Sendable {
             throw SessionError.invalidCredentials
         }
 
-        let authorizationCode = credential.idToken
-        let token = try await exchangeCode(authorizationCode, codeVerifier: codeVerifier)
-        let user = try await fetchUserInfo(accessToken: token.accessToken)
+        var params: [String: String] = [
+            "grant_type":    "authorization_code",
+            "code":          credential.idToken,
+            "client_id":     config.clientID,
+            "code_verifier": codeVerifier,
+        ]
+        if !config.redirectURI.isEmpty {
+            params["redirect_uri"] = config.redirectURI
+        }
 
+        let data:     Data                = try await post(config.tokenEndpoint, form: params)
+        let response: OAuth2TokenResponse = try decode(data)
+        let token = mapToken(response)
+        let user  = try await fetchUserInfo(accessToken: token.accessToken)
         return AuthResult(user: user, token: token)
     }
 
     // MARK: - Refresh Token
 
-    public func refreshToken(_ token: BearerToken) async throws -> AuthResult<BearerToken> {
+    public func refreshToken(_ token: BearerToken, currentUser: SessionUser?) async throws -> AuthResult<BearerToken> {
         guard let refreshToken = token.refreshToken else {
             throw SessionError.tokenRefreshFailed
         }
 
-        let body: [String: String] = [
+        let params: [String: String] = [
             "grant_type":    "refresh_token",
             "refresh_token": refreshToken,
             "client_id":     config.clientID,
         ]
 
-        let newToken = try await postTokenRequest(body: body)
-        let user = try await fetchUserInfo(accessToken: newToken.accessToken)
-
+        let data:     Data                = try await post(config.tokenEndpoint, form: params)
+        let response: OAuth2TokenResponse = try decode(data)
+        let newToken = mapToken(response)
+        // Skip the userinfo round-trip when the engine already has the user cached.
+        // Only fetch when currentUser is nil (e.g. session restore with no stored user).
+        let user = if let currentUser {
+            currentUser
+        } else {
+            try await fetchUserInfo(accessToken: newToken.accessToken)
+        }
         return AuthResult(user: user, token: newToken)
     }
 
     // MARK: - Sign Out (Token Revocation)
 
     public func signOut(token: BearerToken) async throws {
-        guard let endpoint = config.revocationEndpoint else { return }
+        guard let revocationURL = config.revocationEndpoint else { return }
 
-        // Revoke refresh token if available, otherwise revoke access token (RFC 7009)
-        let tokenToRevoke = token.refreshToken ?? token.accessToken
-
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = urlEncode([
-            "token":           tokenToRevoke,
+        let params: [String: String] = [
+            "token":           token.refreshToken ?? token.accessToken,
             "client_id":       config.clientID,
             "token_type_hint": token.refreshToken != nil ? "refresh_token" : "access_token",
-        ])
-
-        let (_, response) = try await session.data(for: request)
-        // RFC 7009: 200 is success, even if the token was already invalid
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw SessionError.providerError("Token revocation failed.")
-        }
-    }
-
-    // MARK: - Private — Token Exchange
-
-    private func exchangeCode(_ code: String, codeVerifier: String) async throws -> BearerToken {
-        var body: [String: String] = [
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "client_id":     config.clientID,
-            "code_verifier": codeVerifier,
         ]
-        if !config.redirectURI.isEmpty {
-            body["redirect_uri"] = config.redirectURI
-        }
-
-        return try await postTokenRequest(body: body)
+        _ = try await post(revocationURL, form: params)
     }
 
-    private func postTokenRequest(body: [String: String]) async throws -> BearerToken {
-        var request = URLRequest(url: config.tokenEndpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = urlEncode(body)
-
-        let (data, response) = try await session.data(for: request)
-
-        guard let http = response as? HTTPURLResponse else {
-            throw SessionError.providerError("Invalid response from token endpoint.")
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let errorBody = String(data: data, encoding: .utf8) ?? "No body"
-            if http.statusCode == 401 || http.statusCode == 403 {
-                throw SessionError.invalidCredentials
-            }
-            throw SessionError.providerError("Token endpoint returned \(http.statusCode): \(errorBody)")
-        }
-
-        return try decodeTokenResponse(data)
-    }
-
-    // MARK: - Private — UserInfo
+    // MARK: - UserInfo
 
     private func fetchUserInfo(accessToken: String) async throws -> SessionUser {
-        guard let endpoint = config.userInfoEndpoint else {
-            // No userinfo endpoint — return a minimal user derived from the access token
-            return SessionUser(id: "oauth2-user", displayName: "User")
+        guard let userInfoURL = config.userInfoEndpoint else {
+            throw SessionError.providerError("Cannot resolve user: userInfoEndpoint is not configured")
         }
 
-        var request = URLRequest(url: endpoint)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-
-        let (data, response) = try await session.data(for: request)
-
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw SessionError.providerError("UserInfo endpoint failed.")
+        let data:     Data                    = try await get(userInfoURL, bearer: accessToken)
+        let response: OAuth2UserInfoResponse  = try decode(data)
+        guard let sub = response.sub else {
+            throw SessionError.providerError("Missing subject claim")
         }
-
-        return try decodeUserInfoResponse(data)
+        return SessionUser(
+            id:          sub,
+            displayName: response.name ?? response.preferred_username ?? "User",
+            email:       response.email,
+            avatarURL:   response.picture.flatMap { URL(string: $0) }
+        )
     }
 
-    // MARK: - Private — Response Decoding
+    // MARK: - Token Mapping
 
-    private func decodeTokenResponse(_ data: Data) throws -> BearerToken {
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        guard let json, let accessToken = json["access_token"] as? String else {
-            throw SessionError.providerError("Missing access_token in token response.")
-        }
-
-        let refreshToken = json["refresh_token"] as? String
-        let tokenType = json["token_type"] as? String ?? "Bearer"
-        let scopeString = json["scope"] as? String ?? ""
-        let scopes = scopeString.isEmpty ? [] : scopeString.split(separator: " ").map(String.init)
-
-        var expiresAt: Date?
-        if let expiresIn = json["expires_in"] as? Int {
-            expiresAt = Date().addingTimeInterval(TimeInterval(expiresIn))
-        }
-
+    private func mapToken(_ r: OAuth2TokenResponse) -> BearerToken {
+        let scopes   = r.scope.map { $0.split(separator: " ").map(String.init) } ?? []
+        let expiresAt = r.expires_in.map { Date().addingTimeInterval(TimeInterval($0)) }
         return BearerToken(
-            accessToken:  accessToken,
-            refreshToken: refreshToken,
+            accessToken:  r.access_token,
+            refreshToken: r.refresh_token,
             expiresAt:    expiresAt,
-            tokenType:    tokenType,
+            tokenType:    r.token_type ?? "Bearer",
             scopes:       scopes
         )
     }
 
-    private func decodeUserInfoResponse(_ data: Data) throws -> SessionUser {
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        guard let json else {
-            throw SessionError.providerError("Invalid UserInfo response.")
-        }
+    // MARK: - Network helpers
 
-        // Standard OpenID Connect claims
-        let sub         = json["sub"] as? String ?? UUID().uuidString
-        let name        = json["name"] as? String ?? json["preferred_username"] as? String ?? "User"
-        let email       = json["email"] as? String
-        let pictureStr  = json["picture"] as? String
-
-        return SessionUser(
-            id:          sub,
-            displayName: name,
-            email:       email,
-            avatarURL:   pictureStr.flatMap { URL(string: $0) }
-        )
+    private func post(_ url: URL, form params: [String: String]) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = formEncode(params)
+        return try await send(request)
     }
 
-    // MARK: - Private — URL Encoding
+    private func get(_ url: URL, bearer token: String) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return try await send(request)
+    }
 
-    private func urlEncode(_ params: [String: String]) -> Data {
-        params
-            .map { key, value in
-                let k = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
-                let v = value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? value
-                return "\(k)=\(v)"
+    private func send(_ request: URLRequest) async throws -> Data {
+        let (data, response) = try await urlSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SessionError.providerError("Non-HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw SessionError.invalidCredentials
             }
+            let body = String(data: data, encoding: .utf8) ?? "No body"
+            throw SessionError.providerError("HTTP \(http.statusCode): \(body)")
+        }
+        return data
+    }
+
+    private func decode<T: Decodable>(_ data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw SessionError.providerError("Response decode failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Form encoding
+
+    private func formEncode(_ params: [String: String]) -> Data {
+        params
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key.formEncoded)=\($0.value.formEncoded)" }
             .joined(separator: "&")
             .data(using: .utf8) ?? Data()
+    }
+}
+
+// MARK: - String + application/x-www-form-urlencoded
+
+private extension String {
+    /// Percent-encodes the string per RFC 3986 for use in a form-encoded body.
+    /// Only unreserved characters (ALPHA / DIGIT / "-" / "." / "_" / "~") are left as-is.
+    var formEncoded: String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return addingPercentEncoding(withAllowedCharacters: allowed) ?? self
     }
 }
