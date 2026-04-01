@@ -33,4 +33,9 @@ final class MockTokenProvider<Token: AuthSessionToken>:
             return token
         }
     }
+
+    func forceRefreshToken() async throws {
+        // Delegate to currentValidToken so callCount and behaviour stay consistent.
+        _ = try await currentValidToken()
+    }
 }

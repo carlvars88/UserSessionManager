@@ -49,6 +49,24 @@ public protocol SessionTokenProviding<Token>: AnyObject, Sendable {
     ///   and the credential store has been cleared (user must sign in again).
     /// - Throws: `SessionError.tokenRefreshFailed` when a required refresh fails.
     func currentValidToken() async throws -> Token
+
+    /// Force an immediate token refresh, bypassing the expiry check.
+    ///
+    /// Call this when the server returns a `401` for a token that appears
+    /// locally valid — for example due to server-side revocation, rolling
+    /// token rotation, or clock skew. After a successful refresh, retry the
+    /// request once. If the server returns a second `401`, the session is
+    /// permanently invalid and `SessionError.sessionExpired` should be surfaced.
+    ///
+    /// If a refresh is already in flight (e.g. from the proactive timer or
+    /// another `currentValidToken()` call), this method joins that task rather
+    /// than starting a second one.
+    ///
+    /// - Throws: `SessionError.sessionNotFound` when no session is active.
+    /// - Throws: `SessionError.sessionExpired` when the refresh is permanently
+    ///   rejected (`invalidCredentials`) and the store has been cleared.
+    /// - Throws: `SessionError.tokenRefreshFailed` on transient failures.
+    func forceRefreshToken() async throws
 }
 
 // MARK: - AnyTokenProvider

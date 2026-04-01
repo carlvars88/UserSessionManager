@@ -277,7 +277,29 @@ internal final class SessionManagerEngine<
         guard let token = cachedToken else { throw SessionError.sessionNotFound }
         guard token.isExpired || needsRefresh(token) else { return }
 
-        let currentUser = state.currentUser
+        try await startRefreshTask(token: token, currentUser: state.currentUser)
+    }
+
+    func forceRefreshToken() async throws {
+        await awaitRestoreIfNeeded()
+        guard state.isAuthenticated else {
+            if case .expired = state { throw SessionError.sessionExpired }
+            throw SessionError.sessionNotFound
+        }
+
+        // Join any already-running refresh rather than issuing a duplicate request.
+        if let ongoing = ongoingRefreshTask {
+            _ = try await ongoing.value
+            return
+        }
+
+        guard let token = cachedToken else { throw SessionError.sessionNotFound }
+        try await startRefreshTask(token: token, currentUser: state.currentUser)
+    }
+
+    /// Starts a one-flight refresh task and awaits its result.
+    /// Callers are responsible for checking `ongoingRefreshTask` before calling.
+    private func startRefreshTask(token: Provider.Token, currentUser: SessionUser?) async throws {
         let task = Task<Void, Error> { [weak self] in
             guard let self else { throw SessionError.unknown("Manager deallocated") }
             do {

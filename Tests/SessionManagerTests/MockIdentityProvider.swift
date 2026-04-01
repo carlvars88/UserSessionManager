@@ -61,6 +61,7 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
     }
 
     public func refreshToken(_ token: BearerToken, currentUser: SessionUser?) async throws -> AuthResult<BearerToken> {
+        refreshCallCount += 1
         try await Task.sleep(for: simulatedLatency)
         guard !shouldFailRefresh else { throw refreshError }
         return makeResult()
@@ -71,6 +72,7 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
     }
 
     public var nativeToken: BearerToken? = nil
+    public private(set) var refreshCallCount = 0
 
     public func currentToken() async -> BearerToken? { nativeToken }
 

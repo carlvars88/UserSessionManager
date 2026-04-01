@@ -128,21 +128,107 @@ struct ContentView: View {
 
 ### 4. Inject into your networking layer
 
+The networking layer depends on **`SessionTokenProviding`**, not on the concrete manager type. Calling `currentValidToken()` always returns a ready-to-use token — if the token is expired or within the proactive refresh window, the engine refreshes it silently before returning. The networking layer never manages token lifecycle itself.
+
+#### Option A — typed (`SessionTokenProviding`)
+
+Use when your `APIClient` is in the same module as `SessionManager` and already knows the token type. You get the full typed token and can read any field:
+
 ```swift
 struct APIClient {
+    // Typed to BearerToken — knows the token shape
+    let tokens: any SessionTokenProviding<BearerToken>
+
+    func request(_ url: URL) async throws -> Data {
+        let token = try await tokens.currentValidToken()
+        // token is a BearerToken — access any field directly
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        return try await URLSession.shared.data(for: req).0
+    }
+}
+
+// Wiring — pass the session manager directly; it conforms to SessionTokenProviding
+let client = APIClient(tokens: session)
+```
+
+#### Option B — type-erased (`AnyTokenProvider`)
+
+Use when `APIClient` lives in a separate module with no dependency on `SessionManager`. `AnyTokenProvider` hides the token type behind a single `currentRawToken() -> String?` accessor:
+
+```swift
+struct APIClient {
+    // No SessionManager import required in this module
     let tokens: AnyTokenProvider
 
     func request(_ url: URL) async throws -> Data {
         var req = URLRequest(url: url)
-        if let token = try await tokens.currentRawToken() {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let value = try await tokens.currentRawToken() {
+            req.setValue("Bearer \(value)", forHTTPHeaderField: "Authorization")
         }
         return try await URLSession.shared.data(for: req).0
     }
 }
 
-// Wiring
+// Wiring — convenience init extracts accessToken automatically for BearerToken
 let client = APIClient(tokens: AnyTokenProvider(session))
+
+// Custom extraction for any other token shape
+let client = APIClient(tokens: AnyTokenProvider(session) { token in token.customField })
+```
+
+`currentRawToken()` returns `nil` for `CookieToken` sessions — cookies are handled automatically by `URLSession`, no header injection needed.
+
+#### Handling 401 responses — retry with forced refresh
+
+`currentValidToken()` refreshes based on local expiry, but the server can reject a locally-valid token at any time (forced logout from another device, password change, rolling token rotation, clock skew). When that happens, `currentValidToken()` returns the same cached token on every call and the request loops into repeated 401s.
+
+Call `forceRefreshToken()` on a 401 to bypass the expiry check and exchange the token immediately, then retry the request once. Give up on a second 401 — the session is permanently invalid:
+
+```swift
+struct APIClient {
+    let tokens: any SessionTokenProviding<BearerToken>
+
+    func request(_ url: URL) async throws -> Data {
+        try await requestWithRetry(url, retryOn401: true)
+    }
+
+    private func requestWithRetry(_ url: URL, retryOn401: Bool) async throws -> Data {
+        let token = try await tokens.currentValidToken()
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: req)
+
+        if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+            guard retryOn401 else {
+                // Second 401 after a forced refresh — session is permanently invalid.
+                throw SessionError.sessionExpired
+            }
+            // Force-refresh the token (bypasses local expiry check), then retry once.
+            try await tokens.forceRefreshToken()
+            return try await requestWithRetry(url, retryOn401: false)
+        }
+
+        return data
+    }
+}
+```
+
+#### Error handling
+
+Both `currentValidToken()` and `forceRefreshToken()` throw when no valid token can be obtained:
+
+```swift
+do {
+    try await tokens.forceRefreshToken()
+} catch SessionError.sessionExpired {
+    // Refresh token permanently rejected — route to sign-in screen.
+} catch SessionError.sessionNotFound {
+    // No active session — request made before sign-in.
+} catch SessionError.tokenRefreshFailed {
+    // Transient failure (network, timeout) — retry later.
+}
+```
 ```
 
 ---
