@@ -117,6 +117,10 @@ public final class ObservableSessionManager<
         try await engine.currentValidToken()
     }
 
+    public func forceRefreshToken() async throws {
+        try await engine.forceRefreshToken()
+    }
+
     // MARK: - Convenience
 
     /// The signed-in user, or `nil` when not authenticated.

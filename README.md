@@ -179,27 +179,56 @@ let client = APIClient(tokens: AnyTokenProvider(session) { token in token.custom
 
 `currentRawToken()` returns `nil` for `CookieToken` sessions — cookies are handled automatically by `URLSession`, no header injection needed.
 
-#### Error handling
+#### Handling 401 responses — retry with forced refresh
 
-Both `currentValidToken()` and `currentRawToken()` throw when no valid token can be obtained. Handle these at the request level to drive your UI:
+`currentValidToken()` refreshes based on local expiry, but the server can reject a locally-valid token at any time (forced logout from another device, password change, rolling token rotation, clock skew). When that happens, `currentValidToken()` returns the same cached token on every call and the request loops into repeated 401s.
+
+Call `forceRefreshToken()` on a 401 to bypass the expiry check and exchange the token immediately, then retry the request once. Give up on a second 401 — the session is permanently invalid:
 
 ```swift
-func request(_ url: URL) async throws -> Data {
-    do {
+struct APIClient {
+    let tokens: any SessionTokenProviding<BearerToken>
+
+    func request(_ url: URL) async throws -> Data {
+        try await requestWithRetry(url, retryOn401: true)
+    }
+
+    private func requestWithRetry(_ url: URL, retryOn401: Bool) async throws -> Data {
         let token = try await tokens.currentValidToken()
-        // … build and send request
-    } catch SessionError.sessionExpired {
-        // Refresh token permanently rejected — user must sign in again.
-        // Post a notification or route to the sign-in screen.
-        throw SessionError.sessionExpired
-    } catch SessionError.sessionNotFound {
-        // No active session — request was made before sign-in.
-        throw SessionError.sessionNotFound
-    } catch SessionError.tokenRefreshFailed {
-        // Transient refresh failure (network, timeout). Retry or surface the error.
-        throw SessionError.tokenRefreshFailed
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: req)
+
+        if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+            guard retryOn401 else {
+                // Second 401 after a forced refresh — session is permanently invalid.
+                throw SessionError.sessionExpired
+            }
+            // Force-refresh the token (bypasses local expiry check), then retry once.
+            try await tokens.forceRefreshToken()
+            return try await requestWithRetry(url, retryOn401: false)
+        }
+
+        return data
     }
 }
+```
+
+#### Error handling
+
+Both `currentValidToken()` and `forceRefreshToken()` throw when no valid token can be obtained:
+
+```swift
+do {
+    try await tokens.forceRefreshToken()
+} catch SessionError.sessionExpired {
+    // Refresh token permanently rejected — route to sign-in screen.
+} catch SessionError.sessionNotFound {
+    // No active session — request made before sign-in.
+} catch SessionError.tokenRefreshFailed {
+    // Transient failure (network, timeout) — retry later.
+}
+```
 ```
 
 ---

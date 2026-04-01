@@ -485,6 +485,62 @@ final class UserSessionManagerTests: XCTestCase {
           catch { XCTFail("Wrong error: \(error)") }
     }
 
+    // MARK: - Force Refresh Token
+
+    @MainActor
+    func test_forceRefreshToken_refreshesEvenWhenTokenIsValid() async throws {
+        // Token lifetime is 1 hour — not expired, not near expiry.
+        // currentValidToken() would return it without touching the provider.
+        // forceRefreshToken() must call the provider regardless.
+        let provider = MockIdentityProvider(simulatedLatency: .zero, tokenLifetime: 3600)
+        let sut = SUT(provider: provider, store: InMemoryCredentialStore<BearerToken>())
+        await sut.signIn(with: validCredential())
+        XCTAssertTrue(sut.isAuthenticated)
+        XCTAssertEqual(provider.refreshCallCount, 0)
+
+        try await sut.forceRefreshToken()
+
+        XCTAssertEqual(provider.refreshCallCount, 1)
+        XCTAssertTrue(sut.isAuthenticated)
+    }
+
+    @MainActor
+    func test_forceRefreshToken_whenNotSignedIn_throwsSessionNotFound() async {
+        let sut = makeSUT()
+        _ = try? await sut.currentValidToken() // drain restore
+        do {
+            try await sut.forceRefreshToken()
+            XCTFail("Expected sessionNotFound")
+        } catch SessionError.sessionNotFound { /* ✅ */ }
+          catch { XCTFail("Wrong error: \(error)") }
+    }
+
+    @MainActor
+    func test_forceRefreshToken_permanentFailure_transitionsToExpired() async throws {
+        let sut = makeSUT(failRefresh: false)
+        await sut.signIn(with: validCredential())
+        XCTAssertTrue(sut.isAuthenticated)
+
+        // Switch provider to permanent failure after sign-in
+        // (simulates server-side revocation between requests)
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .invalidCredentials
+        )
+        let sut2 = SUT(provider: provider, store: InMemoryCredentialStore<BearerToken>())
+        await sut2.signIn(with: validCredential())
+        provider.shouldFailRefresh = true
+
+        do {
+            try await sut2.forceRefreshToken()
+            XCTFail("Expected tokenRefreshFailed")
+        } catch SessionError.tokenRefreshFailed { /* ✅ */ }
+          catch { XCTFail("Wrong error: \(error)") }
+
+        XCTAssertEqual(sut2.state, .expired)
+    }
+
     @MainActor
     func test_updateUser_whenNotSignedIn_isNoOp() {
         let sut = makeSUT()
