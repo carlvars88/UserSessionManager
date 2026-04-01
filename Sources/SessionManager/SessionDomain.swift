@@ -1,29 +1,25 @@
 // MARK: - Models/SessionDomain.swift
 //
 // Pure domain types. No framework imports beyond Foundation. No IdP specifics.
-//
-// KEY CHANGE — AuthSessionToken protocol
-// ───────────────────────────────────────
-// The old concrete `AuthToken` struct assumed every backend speaks OAuth2/Bearer.
-// `AuthSessionToken` is the abstraction every generic is now parameterised over.
-// Each IdentityProvider declares its own concrete Token type that conforms to it.
-//
-// Three concrete token types are provided out of the box:
-//   BearerToken        — OAuth2 / JWT (access + refresh + expiry + scopes)
-//   OpaqueSessionToken — custom backend (single opaque string, optional expiry)
-//   CookieToken        — cookie-based session (no data carried in-process)
-//
-// Adding a new token shape requires zero changes to the session manager or protocols.
 
 import Foundation
 
 // MARK: - SessionUser
 
+/// A snapshot of the authenticated user's profile.
+///
+/// `SessionUser` is immutable. To update profile fields, call
+/// `UserSessionManaging.updateUser(_:)` with a new instance.
 public struct SessionUser: Sendable, Equatable, Codable, Identifiable {
+    /// A stable, provider-issued identifier for the user (e.g. a UUID or `sub` claim).
     public let id: String
+    /// A human-readable display name (full name, username, or email prefix).
     public let displayName: String
+    /// The user's email address, if provided by the identity provider.
     public let email: String?
+    /// URL to the user's avatar image, if provided by the identity provider.
     public let avatarURL: URL?
+    /// Arbitrary key-value metadata from the identity provider.
     public let metadata: [String: String]
 
     public init(
@@ -45,49 +41,59 @@ public struct SessionUser: Sendable, Equatable, Codable, Identifiable {
 
 /// The behavioural contract every token type must satisfy.
 ///
-/// Deliberately minimal — carries only what the session manager needs to make
-/// decisions. All other fields (scopes, token type, raw values…) are the
-/// concrete type's business.
+/// Deliberately minimal — carries only what the session manager needs to
+/// make decisions. All other fields (scopes, token type, raw values…) are
+/// the concrete type's business.
+///
+/// ## Implementing a custom token type
+///
+/// ```swift
+/// struct MyToken: AuthSessionToken {
+///     let value: String
+///     let expiresAt: Date?
+///     var isExpired: Bool {
+///         expiresAt.map { $0 <= Date() } ?? false
+///     }
+/// }
+/// ```
 public protocol AuthSessionToken: Sendable, Codable, Equatable {
 
-    /// True when the token can no longer be used and a refresh is required.
+    /// `true` when the token can no longer be used and a refresh is required.
     var isExpired: Bool { get }
 
-    /// True when the token is close enough to expiry that a proactive refresh
-    /// should be triggered (default: within 60 seconds).
-    var needsProactiveRefresh: Bool { get }
-
-    /// Expiration date, if applicable. Used by the session manager to schedule
-    /// proactive refresh timers. Return nil for tokens that never expire.
+    /// Expiration date, if known. The session manager uses this to schedule
+    /// proactive refresh timers. Return `nil` for tokens that never expire.
     var expiresAt: Date? { get }
 }
 
-// Default implementation — conformers can override with their own threshold.
 public extension AuthSessionToken {
-    var needsProactiveRefresh: Bool { isExpired }
+    /// Default implementation returns `nil` (token does not expire).
     var expiresAt: Date? { nil }
 }
 
-// MARK: - BearerToken  (OAuth2 / JWT)
+// MARK: - BearerToken
 
-/// OAuth2 / Bearer token pair.
-/// Use with providers that return access + refresh tokens (Google, Firebase,
-/// Auth0, custom OAuth2 servers, etc.).
+/// An OAuth2 / Bearer token pair.
+///
+/// Use with providers that return access and refresh tokens — Google,
+/// Auth0, Okta, Keycloak, Azure AD, or any RFC 6749-compliant server.
 public struct BearerToken: AuthSessionToken {
+    /// The short-lived access token sent in `Authorization: Bearer` headers.
     public let accessToken: String
+    /// The long-lived refresh token used to obtain a new access token.
+    /// `nil` for providers that do not issue refresh tokens.
     public let refreshToken: String?
+    /// When the access token expires. `nil` if the provider does not return `expires_in`.
     public let expiresAt: Date?
+    /// The token type (typically `"Bearer"`).
     public let tokenType: String
+    /// OAuth2 scopes granted for this token.
     public let scopes: [String]
 
+    /// `true` when `expiresAt` is in the past.
     public var isExpired: Bool {
         guard let exp = expiresAt else { return false }
         return exp <= Date()
-    }
-
-    public var needsProactiveRefresh: Bool {
-        guard let exp = expiresAt else { return false }
-        return exp.timeIntervalSinceNow < 60
     }
 
     public init(
@@ -105,22 +111,22 @@ public struct BearerToken: AuthSessionToken {
     }
 }
 
-// MARK: - OpaqueSessionToken  (custom / username-password backends)
+// MARK: - OpaqueSessionToken
 
 /// A single opaque session token returned by a custom auth backend.
-/// Has no refresh token — expiry (if any) causes a full re-login.
+///
+/// Has no refresh token — when the token expires the session manager
+/// transitions to `.expired` and the user must sign in again.
 public struct OpaqueSessionToken: AuthSessionToken {
+    /// The opaque token string issued by the server.
     public let value: String
+    /// When the token expires, if known.
     public let expiresAt: Date?
 
+    /// `true` when `expiresAt` is in the past.
     public var isExpired: Bool {
         guard let exp = expiresAt else { return false }
         return exp <= Date()
-    }
-
-    public var needsProactiveRefresh: Bool {
-        guard let exp = expiresAt else { return false }
-        return exp.timeIntervalSinceNow < 60
     }
 
     public init(value: String, expiresAt: Date? = nil) {
@@ -129,17 +135,22 @@ public struct OpaqueSessionToken: AuthSessionToken {
     }
 }
 
-// MARK: - CookieToken  (cookie-based sessions)
+// MARK: - CookieToken
 
-/// Represents a session maintained entirely via HTTP cookies.
-/// No token data is held in-process — the cookie lives in HTTPCookieStorage.
-/// The manager uses this as a presence signal only: if it exists, the session
-/// is assumed valid; if refresh is needed the provider must re-validate.
+/// A presence signal for cookie-based sessions.
+///
+/// No token data is held in-process — the actual cookie lives in
+/// `HTTPCookieStorage` and is attached to requests automatically by
+/// `URLSession`. The session manager uses this type as a signal only:
+/// if a `CookieToken` exists in the credential store, the session is
+/// assumed valid.
 public struct CookieToken: AuthSessionToken {
-    /// The cookie name that identifies the session (e.g. "session_id").
+    /// The name of the cookie that identifies the session (e.g. `"session_id"`).
     public let cookieName: String
+    /// When the cookie expires, if known.
     public let expiresAt: Date?
 
+    /// `true` when `expiresAt` is in the past.
     public var isExpired: Bool {
         guard let exp = expiresAt else { return false }
         return exp <= Date()
@@ -153,53 +164,81 @@ public struct CookieToken: AuthSessionToken {
 
 // MARK: - AuthOperation
 
+/// An in-progress session operation. Associated with the `.loading` state.
 public enum AuthOperation: Equatable, Sendable {
+    /// The session manager is restoring a previously persisted session on launch.
     case restoringSession
+    /// A sign-in operation is in progress.
     case signingIn
+    /// A sign-out operation is in progress.
     case signingOut
+    /// A background token refresh is in progress.
     case refreshingToken
+    /// A re-authentication operation is in progress.
     case reauthenticating
 }
 
 // MARK: - SessionState
-//
-// Single source of truth for the entire session lifecycle.
-// isLoading and lastError are derived from state — they cannot contradict it.
 
+/// The complete state of the session lifecycle.
+///
+/// `SessionState` is the single source of truth. All derived properties
+/// (`isLoading`, `error`, `currentUser`, `isAuthenticated`) are computed
+/// from it — they cannot contradict the state.
+///
+/// ## State machine
+/// ```
+/// .loading(.restoringSession)  ← initial state on every app launch
+///         ↓
+/// .signedOut  ←──────────────────────────────────────────┐
+///         ↓                                              │
+/// .loading(.signingIn)                             .signOut()
+///         ↓                                              │
+/// .signedIn(SessionUser) ────────────────────────────────┘
+///         ↓ (token refresh rejected by server)
+/// .expired
+///         ↓ (any auth error)
+/// .failed(SessionError)
+/// ```
 public enum SessionState: Equatable, Sendable {
 
-    /// App launch — restoring a persisted session.
+    /// The session manager is performing an async operation.
     case loading(AuthOperation)
 
-    /// No session. Ready to sign in.
+    /// No session exists. The user must sign in.
     case signedOut
 
-    /// A valid session exists.
+    /// A valid session exists for the given user.
     case signedIn(SessionUser)
 
-    /// The last auth operation failed.
+    /// The most recent auth operation failed.
     case failed(SessionError)
 
-    /// A session existed but silent token refresh failed.
+    /// A session existed but the server permanently rejected a token refresh.
+    /// The credential store has been cleared. The user must sign in again.
     case expired
 
     // MARK: Derived helpers
 
+    /// `true` while any auth operation is in progress.
     public var isLoading: Bool {
         if case .loading = self { return true }
         return false
     }
 
+    /// The error from the most recent failed operation, or `nil`.
     public var error: SessionError? {
         if case .failed(let e) = self { return e }
         return nil
     }
 
+    /// The signed-in user, or `nil` when not authenticated.
     public var currentUser: SessionUser? {
         if case .signedIn(let u) = self { return u }
         return nil
     }
 
+    /// `true` only in the `.signedIn` state.
     public var isAuthenticated: Bool {
         if case .signedIn = self { return true }
         return false
@@ -208,15 +247,41 @@ public enum SessionState: Equatable, Sendable {
 
 // MARK: - SessionError
 
+/// Errors produced by the session manager and its identity providers.
 public enum SessionError: Error, LocalizedError, Equatable, Sendable {
+
+    /// The supplied credentials were rejected by the server.
+    /// During token refresh this is treated as a **permanent** failure —
+    /// the credential store is cleared and the session transitions to `.expired`.
     case invalidCredentials
+
+    /// The identity provider returned an error with the given description.
     case providerError(String)
+
+    /// A token refresh attempt failed. May be transient (network, timeout)
+    /// or permanent (`invalidCredentials` from the server).
     case tokenRefreshFailed
+
+    /// The session has expired and the credential store has been cleared.
+    /// The user must sign in again.
     case sessionExpired
+
+    /// No active session was found. Thrown by `currentValidToken()` when
+    /// the session is in any non-authenticated state other than `.expired`.
     case sessionNotFound
+
+    /// A keychain read or write operation failed with the given reason.
     case credentialStoreFailed(String)
+
+    /// The operation was cancelled by the user (e.g. the user dismissed
+    /// an `ASWebAuthenticationSession` prompt).
     case cancelled
+
+    /// The operation did not complete within `SessionManagerConfiguration.operationTimeout`.
     case timeout
+
+    /// An unexpected error occurred. The associated string is the underlying
+    /// error's `localizedDescription`.
     case unknown(String)
 
     public var errorDescription: String? {

@@ -5,7 +5,6 @@
 // and ObservableSessionManager (@Observable) are thin wrappers over this engine.
 
 import Foundation
-import os.log
 
 @MainActor
 internal final class SessionManagerEngine<
@@ -30,19 +29,30 @@ internal final class SessionManagerEngine<
     private var cachedToken: Provider.Token?
 
     // ── One-flight refresh guard ────────────────────────────────────────────
-    private var ongoingRefreshTask: Task<Provider.Token, Error>?
+    // Void return: callers never read the token from the task — they read cachedToken
+    // after it settles. Task<Void,Error> is used (not Never) so concurrent callers of
+    // currentValidToken() receive the thrown error if refresh fails.
+    private var ongoingRefreshTask: Task<Void, Error>?
+
+    // ── Current user-initiated operation (signIn, reauthenticate) ────────────
+    // signOut awaits this before proceeding, ensuring it always wins.
+    private var currentOperationTask: Task<Void, Never>?
 
     // ── Session restore gate ──────────────────────────────────────────────
     private var restoreTask: Task<Void, Never>?
 
+    // ── Pending user-update persistence ─────────────────────────────────────
+    private var pendingPersistTask: Task<Void, Never>?
+
     // ── Proactive expiry timer ──────────────────────────────────────────────
+    // The only task that requires explicit cancellation: it sleeps for up to
+    // (tokenLifetime - proactiveRefreshBuffer) seconds. All other tasks either
+    // nil themselves on completion or exit promptly via [weak self] checks.
     private var refreshTimer: Task<Void, Never>?
 
     // ── Logger ──────────────────────────────────────────────────────────────
-    private let log = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "app",
-        category: "SessionManager[\(Provider.self)]"
-    )
+    private let log:      any SessionLogger
+    private let logLevel: LogLevel
 
     // MARK: Init
 
@@ -54,7 +64,35 @@ internal final class SessionManagerEngine<
         self.provider      = provider
         self.store         = store
         self.configuration = configuration
+        self.log           = configuration.logger
+        self.logLevel      = configuration.logLevel
         restoreTask = Task { await self.restoreSession() }
+    }
+
+    /// Applies the configured `logLevel` threshold then delegates to the injected logger.
+    /// Use this instead of calling `log` directly so the threshold is always respected.
+    private func emit(
+        _ level: LogLevel,
+        _ message: @autoclosure @Sendable () -> String,
+        file: String = #fileID, function: String = #function, line: UInt = #line
+    ) {
+        guard level >= logLevel, log.isEnabled(level) else { return }
+        log.log(level: level, message(), file: file, function: function, line: line)
+    }
+
+    // MARK: - Teardown
+
+    /// Cancels the proactive refresh timer. Called from wrapper deinit via a
+    /// fire-and-forget Task to hop onto the main actor.
+    ///
+    /// Other tasks (restoreTask, currentOperationTask, ongoingRefreshTask,
+    /// pendingPersistTask) do not need explicit cancellation: they are either
+    /// short-lived network/IO operations that exit promptly via [weak self],
+    /// or they nil themselves via defer/await on normal completion.
+    /// Only refreshTimer can sleep for up to (tokenLifetime - proactiveRefreshBuffer)
+    /// seconds and warrants an explicit cancel when the manager is deallocated.
+    func tearDown() {
+        cancelRefreshTimer()
     }
 
     /// Awaits the initial session restore if it hasn't completed yet.
@@ -70,31 +108,54 @@ internal final class SessionManagerEngine<
         guard !state.isLoading else { return }
         transition(to: .loading(.signingIn))
 
-        do {
-            let result = try await withOperationTimeout {
-                try await self.provider.signIn(with: credential)
+        let task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.withOperationTimeout {
+                    try await self.provider.signIn(with: credential)
+                }
+                try Task.checkCancellation()
+                try await self.persist(result)
+                try Task.checkCancellation()
+                self.transition(to: .signedIn(result.user))
+                self.scheduleProactiveRefresh(for: result.token)
+                self.emit(.info, "[\(self.provider.providerID)] Signed in.")
+            } catch is CancellationError {
+                // Provider threw CancellationError (e.g. user dismissed ASWebAuthenticationSession).
+                // Transition to .failed(.cancelled) so the UI can react (re-enable the sign-in button,
+                // show a message, etc.).
+                self.transition(to: .failed(.cancelled))
+                self.emit(.info, "[\(self.provider.providerID)] Sign-in cancelled.")
+            } catch let error as SessionError {
+                self.transition(to: .failed(error))
+                self.emit(.error, "[\(self.provider.providerID)] Sign-in failed: \(error)")
+            } catch {
+                self.transition(to: .failed(.unknown(error.localizedDescription)))
             }
-            try await persist(result)
-            transition(to: .signedIn(result.user))
-            scheduleProactiveRefresh(for: result.token)
-            log.info("[\(self.provider.providerID)] Signed in — \(result.user.id)")
-        } catch let error as SessionError {
-            transition(to: .failed(error))
-            log.error("[\(self.provider.providerID)] Sign-in failed: \(error)")
-        } catch {
-            transition(to: .failed(.unknown(error.localizedDescription)))
         }
+        currentOperationTask = task
+        await task.value
+        currentOperationTask = nil
     }
 
     // MARK: - Sign Out
 
     func signOut() async {
         await awaitRestoreIfNeeded()
-        guard !state.isLoading else {
-            log.warning("[\(self.provider.providerID)] Sign-out ignored — another operation in progress.")
-            return
-        }
+        guard state != .signedOut else { return }
+        // Wait for any in-flight operation (signIn, reauthenticate) to settle first.
+        // Cancelling mid-flight risks leaving a dangling server-side session: the provider
+        // may have already issued tokens before the cancellation propagated, leaving tokens
+        // the client can no longer revoke because cachedToken was never set.
+        await currentOperationTask?.value
+        currentOperationTask = nil
+        // Drain any pending user-update persistence
+        await pendingPersistTask?.value
+        pendingPersistTask = nil
+        // Cancel in-flight token refresh
         cancelRefreshTimer()
+        ongoingRefreshTask?.cancel()
+        ongoingRefreshTask = nil
         transition(to: .loading(.signingOut))
         if let token = cachedToken {
             do {
@@ -121,35 +182,69 @@ internal final class SessionManagerEngine<
         await awaitRestoreIfNeeded()
         guard let user = state.currentUser else { throw SessionError.sessionNotFound }
         guard !state.isLoading else {
-            log.warning("[\(self.provider.providerID)] Reauthentication ignored — another operation in progress.")
-            return
+            log.warning("[\(self.provider.providerID)] Reauthentication rejected — another operation in progress.")
+            throw SessionError.providerError("Another operation is in progress")
         }
         transition(to: .loading(.reauthenticating))
-        do {
-            let result = try await withOperationTimeout {
-                try await self.provider.reauthenticate(user: user, with: credential)
+
+        // Run inside currentOperationTask so signOut can cancel it if called concurrently.
+        var thrownError: Error?
+        let task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.withOperationTimeout {
+                    try await self.provider.reauthenticate(user: user, with: credential)
+                }
+                try Task.checkCancellation()
+                try await self.persist(result)
+                try Task.checkCancellation()
+                self.transition(to: .signedIn(result.user))
+                self.emit(.info, "[\(self.provider.providerID)] Re-authenticated.")
+            } catch is CancellationError {
+                // Restore to .signedIn — the user is still authenticated.
+                self.transition(to: .signedIn(user))
+                self.emit(.info, "[\(self.provider.providerID)] Reauthentication cancelled.")
+            } catch {
+                self.transition(to: .signedIn(user))   // failed re-auth must not sign out
+                thrownError = error
             }
-            try await persist(result)
-            transition(to: .signedIn(result.user))
-            log.info("[\(self.provider.providerID)] Re-authenticated: \(result.user.id)")
-        } catch {
-            transition(to: .signedIn(user))   // failed re-auth must not sign out
-            throw error
         }
+        currentOperationTask = task
+        await task.value
+        currentOperationTask = nil
+        if let error = thrownError { throw error }
     }
 
-    // MARK: - Update User
+    // MARK: - Update User (#5: tracked persist task, drained by signOut)
 
     func updateUser(_ user: SessionUser) {
         guard state.isAuthenticated, let token = cachedToken else { return }
-        Task { [weak self] in
+        pendingPersistTask = Task { [weak self] in
             do {
                 try await self?.store.save(token: token, user: user)
             } catch {
-                self?.log.warning("[\(self?.provider.providerID ?? "??")] Store save failed during user update: \(error)")
+                guard let self else { return }
+                self.emit(.warning, "[\(self.provider.providerID)] Store save failed during user update: \(error)")
             }
         }
         transition(to: .signedIn(user))
+    }
+
+    // MARK: - Refresh User
+
+    func refreshUser() async throws {
+        await awaitRestoreIfNeeded()
+        guard state.isAuthenticated, let token = cachedToken else {
+            throw SessionError.sessionNotFound
+        }
+        let result = try await withOperationTimeout {
+            // currentUser: nil signals the provider to re-fetch the user profile.
+            try await self.provider.refreshToken(token, currentUser: nil)
+        }
+        try await persist(result)
+        transition(to: .signedIn(result.user))
+        scheduleProactiveRefresh(for: result.token)
+        emit(.info, "[\(self.provider.providerID)] User profile refreshed.")
     }
 
     // MARK: - Token Access
@@ -169,7 +264,10 @@ internal final class SessionManagerEngine<
     // MARK: - Private — Token Refresh (one-flight guarantee)
 
     private func refreshIfNeeded() async throws {
-        guard state.isAuthenticated else { throw SessionError.sessionNotFound }
+        guard state.isAuthenticated else {
+            if case .expired = state { throw SessionError.sessionExpired }
+            throw SessionError.sessionNotFound
+        }
 
         if let ongoing = ongoingRefreshTask {
             _ = try await ongoing.value
@@ -177,49 +275,83 @@ internal final class SessionManagerEngine<
         }
 
         guard let token = cachedToken else { throw SessionError.sessionNotFound }
-        guard token.needsProactiveRefresh else { return }
+        guard token.isExpired || needsRefresh(token) else { return }
 
-        let task = Task<Provider.Token, Error> { [weak self] in
+        let currentUser = state.currentUser
+        let task = Task<Void, Error> { [weak self] in
             guard let self else { throw SessionError.unknown("Manager deallocated") }
             do {
-                let result = try await self.provider.refreshToken(token)
+                let result = try await self.provider.refreshToken(token, currentUser: currentUser)
                 try await self.persist(result)
                 await MainActor.run {
                     self.transition(to: .signedIn(result.user))
                     self.scheduleProactiveRefresh(for: result.token)
                 }
-                self.log.info("[\(self.provider.providerID)] Token refreshed.")
-                return result.token
+                self.emit(.info, "[\(self.provider.providerID)] Token refreshed.")
             } catch {
-                await MainActor.run { self.transition(to: .expired) }
-                do {
-                    try await self.store.clear()
-                } catch {
-                    self.log.warning("[\(self.provider.providerID)] Store clear failed after refresh failure: \(error)")
+                // Only treat the session as permanently invalid when the server has
+                // explicitly rejected the credential (invalidCredentials). Network
+                // errors, timeouts, and 5xx are transient — preserve the store so
+                // the next currentValidToken() call can retry without forcing re-login.
+                if case SessionError.invalidCredentials = error {
+                    await MainActor.run { self.transition(to: .expired) }
+                    do {
+                        try await self.store.clear()
+                    } catch {
+                        self.emit(.warning, "[\(self.provider.providerID)] Store clear failed after permanent refresh failure: \(error)")
+                    }
+                    self.emit(.error, "[\(self.provider.providerID)] Refresh failed permanently: \(error)")
+                } else {
+                    self.emit(.warning, "[\(self.provider.providerID)] Refresh failed (transient): \(error)")
                 }
-                self.log.error("[\(self.provider.providerID)] Refresh failed: \(error)")
                 throw SessionError.tokenRefreshFailed
             }
         }
 
         ongoingRefreshTask = task
         defer { ongoingRefreshTask = nil }
-        _ = try await task.value
+        try await task.value
     }
 
-    // MARK: - Private — Session Restore
+    /// Returns true if the token is close enough to expiry that a refresh should be triggered,
+    /// using the configured `proactiveRefreshBuffer` rather than the token's hardcoded threshold.
+    private func needsRefresh(_ token: Provider.Token) -> Bool {
+        guard let exp = token.expiresAt else { return false }
+        return exp.timeIntervalSinceNow < configuration.proactiveRefreshBuffer
+    }
+
+    // MARK: - Private — Session Restore (#2: timeout protection, #6: native token fallback)
 
     private func restoreSession() async {
         do {
-            if let nativeToken = await provider.currentToken() {
-                cachedToken = nativeToken
+            // 1. Provider-native cache (e.g. Firebase SDK)
+            let nativeToken: Provider.Token? = try await withOperationTimeout {
+                await self.provider.currentToken()
+            }
+            if let nativeToken {
                 if let stored = try? await store.load() {
+                    cachedToken = nativeToken
                     transition(to: .signedIn(stored.user))
                     scheduleProactiveRefresh(for: nativeToken)
                     return
                 }
+                // #6: Provider has token but no stored user — try refresh to get user info.
+                // currentUser is nil here; providers should fetch user profile if needed.
+                do {
+                    let result = try await withOperationTimeout {
+                        try await self.provider.refreshToken(nativeToken, currentUser: nil)
+                    }
+                    try await persist(result)
+                    transition(to: .signedIn(result.user))
+                    scheduleProactiveRefresh(for: result.token)
+                    return
+                } catch {
+                    log.warning("Provider token exists but no stored user and refresh failed — signing out.")
+                    // Fall through to store-only path
+                }
             }
 
+            // 2. Our own CredentialStore
             guard let stored = try await store.load() else {
                 transition(to: .signedOut); return
             }
@@ -227,7 +359,9 @@ internal final class SessionManagerEngine<
 
             if stored.token.isExpired {
                 log.info("Stored token expired — attempting silent refresh.")
-                let result = try await provider.refreshToken(stored.token)
+                let result = try await withOperationTimeout {
+                    try await self.provider.refreshToken(stored.token, currentUser: stored.user)
+                }
                 try await persist(result)
                 transition(to: .signedIn(result.user))
                 scheduleProactiveRefresh(for: result.token)
@@ -236,11 +370,18 @@ internal final class SessionManagerEngine<
                 scheduleProactiveRefresh(for: stored.token)
             }
         } catch {
-            log.warning("Session restore failed — signing out. \(error)")
-            do {
-                try await store.clear()
-            } catch {
-                log.warning("[\(self.provider.providerID)] Store clear failed during restore cleanup: \(error)")
+            // Permanent auth rejection: stored credentials are invalid — clear them.
+            // Transient failures (network, timeout): preserve the store so the user
+            // isn't forced to re-login after a momentary connectivity issue.
+            if case SessionError.invalidCredentials = error {
+                log.warning("[\(self.provider.providerID)] Session restore failed permanently — clearing store.")
+                do {
+                    try await store.clear()
+                } catch {
+                    log.warning("[\(self.provider.providerID)] Store clear failed during restore cleanup: \(error)")
+                }
+            } else {
+                log.warning("[\(self.provider.providerID)] Session restore failed (transient) — signing out without clearing store. \(error)")
             }
             cachedToken = nil
             transition(to: .signedOut)
@@ -257,11 +398,12 @@ internal final class SessionManagerEngine<
         state = newState
     }
 
-    // MARK: - Private — Proactive Refresh Timer
+    // MARK: - Private — Proactive Refresh Timer (#3: uses configured buffer)
 
     private func scheduleProactiveRefresh(for token: Provider.Token) {
         cancelRefreshTimer()
-        guard token.needsProactiveRefresh == false,
+        guard !token.isExpired,
+              !needsRefresh(token),
               let exp = token.expiresAt
         else { return }
 

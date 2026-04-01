@@ -2,52 +2,90 @@
 //
 // The networking layer's only dependency on the session system.
 //
-// Now generic over Token so APIClient can be typed to the token shape it actually
+// Generic over Token so APIClient can be typed to the token shape it actually
 // uses (e.g. BearerToken for Authorization header injection, CookieToken as a
 // signal-only type, OpaqueSessionToken for custom header injection).
-//
-// Because Token: AuthSessionToken has no PAP-causing requirements beyond what
-// the concrete APIClient already knows, existential `any SessionTokenProviding`
-// works fine for simple cases. For full type erasure use AnyTokenProvider below.
-//
-// Injection examples:
-//
-//   // Concrete — APIClient knows it works with BearerToken
-//   struct APIClient {
-//       let tokens: any SessionTokenProviding<BearerToken>
-//   }
-//
-//   // Erased — APIClient needs no knowledge of the token shape
-//   struct APIClient {
-//       let tokens: AnyTokenProvider
-//       // uses tokens.currentRawToken() → String for header injection
-//   }
 
 import Foundation
 
 // MARK: - SessionTokenProviding
 
+/// The session contract for the networking layer.
+///
+/// The networking layer should depend only on this protocol — it has no
+/// knowledge of session state, credentials, or the concrete manager type.
+/// `currentValidToken()` handles silent refresh transparently: if the token
+/// is expired or close to expiry, it refreshes before returning.
+///
+/// Conforms to `@MainActor` — `currentValidToken()` is `async`, so callers
+/// on any actor can `await` it and Swift hops to the main actor automatically.
+///
+/// ## Typical networking usage
+///
+/// ```swift
+/// struct APIClient {
+///     let tokens: any SessionTokenProviding<BearerToken>
+///
+///     func request(_ url: URL) async throws -> Data {
+///         let token = try await tokens.currentValidToken()
+///         var req = URLRequest(url: url)
+///         req.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
+///         return try await URLSession.shared.data(for: req).0
+///     }
+/// }
+///
+/// // Wiring — the APIClient never imports UserSessionManager
+/// let client = APIClient(tokens: session)
+/// ```
+@MainActor
 public protocol SessionTokenProviding<Token>: AnyObject, Sendable {
+    /// The token shape this provider vends.
     associatedtype Token: AuthSessionToken
+
+    /// Return a valid token, refreshing silently if necessary.
+    ///
+    /// - Throws: `SessionError.sessionNotFound` when no session is active.
+    /// - Throws: `SessionError.sessionExpired` when the session has expired
+    ///   and the credential store has been cleared (user must sign in again).
+    /// - Throws: `SessionError.tokenRefreshFailed` when a required refresh fails.
     func currentValidToken() async throws -> Token
 }
 
 // MARK: - AnyTokenProvider
-//
-// Type-erases SessionTokenProviding<Token> down to a single string accessor.
-// Use when the networking layer only needs to inject a header value and has
-// no interest in the token's shape or lifecycle.
-//
-// Supports BearerToken (Authorization: Bearer <accessToken>),
-//          OpaqueSessionToken (X-Session-Token: <value>),
-//          CookieToken (no header — cookies handled by URLSession automatically).
 
+/// A type-erased wrapper around `SessionTokenProviding` that exposes a single
+/// raw string accessor for HTTP header injection.
+///
+/// Use `AnyTokenProvider` to decouple the networking layer entirely from the
+/// token shape. The networking layer only calls `currentRawToken()` — it never
+/// imports or references the concrete token type.
+///
+/// ```swift
+/// struct APIClient {
+///     let tokens: AnyTokenProvider
+///
+///     func request(_ url: URL) async throws -> Data {
+///         var req = URLRequest(url: url)
+///         if let value = try await tokens.currentRawToken() {
+///             req.setValue("Bearer \(value)", forHTTPHeaderField: "Authorization")
+///         }
+///         return try await URLSession.shared.data(for: req).0
+///     }
+/// }
+///
+/// // BearerToken convenience — no closure needed
+/// let client = APIClient(tokens: AnyTokenProvider(session))
+/// ```
 public final class AnyTokenProvider: Sendable {
 
     private let _rawValue: @Sendable () async throws -> String?
 
-    /// - Parameter rawValue: closure that returns the header-injectable string,
-    ///   or nil if the token needs no header (e.g. CookieToken).
+    /// Creates an `AnyTokenProvider` with a custom extraction closure.
+    ///
+    /// - Parameters:
+    ///   - provider: The underlying `SessionTokenProviding` instance.
+    ///   - rawValue: Closure that converts the token to an injectable string,
+    ///     or returns `nil` when no header is required (e.g. cookie-based sessions).
     public init<P: SessionTokenProviding>(
         _ provider: P,
         rawValue: @escaping @Sendable (P.Token) -> String?
@@ -59,7 +97,11 @@ public final class AnyTokenProvider: Sendable {
         }
     }
 
-    /// Returns the injectable header value, or nil for cookie-based sessions.
+    /// Returns the injectable header value for the current valid token,
+    /// or `nil` for cookie-based sessions where no header is required.
+    ///
+    /// - Throws: `SessionError.sessionNotFound`, `.sessionExpired`, or
+    ///   `.tokenRefreshFailed` when a valid token cannot be obtained.
     public func currentRawToken() async throws -> String? {
         try await _rawValue()
     }
@@ -69,53 +111,21 @@ public final class AnyTokenProvider: Sendable {
 
 public extension AnyTokenProvider {
 
-    /// For BearerToken providers — returns the accessToken string.
+    /// Creates an `AnyTokenProvider` for a `BearerToken` provider.
+    /// Returns `accessToken` as the raw header value.
     convenience init<P: SessionTokenProviding>(_ provider: P) where P.Token == BearerToken {
         self.init(provider, rawValue: { $0.accessToken })
     }
 
-    /// For OpaqueSessionToken providers — returns the value string.
+    /// Creates an `AnyTokenProvider` for an `OpaqueSessionToken` provider.
+    /// Returns `value` as the raw header value.
     convenience init<P: SessionTokenProviding>(_ provider: P) where P.Token == OpaqueSessionToken {
         self.init(provider, rawValue: { $0.value })
     }
 
-    /// For CookieToken providers — no header needed, returns nil.
+    /// Creates an `AnyTokenProvider` for a `CookieToken` provider.
+    /// Returns `nil` — cookies are handled automatically by `URLSession`.
     convenience init<P: SessionTokenProviding>(_ provider: P) where P.Token == CookieToken {
         self.init(provider, rawValue: { _ in nil })
-    }
-}
-
-// MARK: - MockTokenProvider  (networking unit tests)
-//
-// Generic over Token so networking tests can use any token shape without
-// any dependency on IdentityProvider, CredentialStore, or UserSessionManager.
-
-public final class MockTokenProvider<Token: AuthSessionToken>:
-    SessionTokenProviding, @unchecked Sendable
-{
-    public enum Behaviour {
-        case success(Token)
-        case failure(SessionError)
-        case expiresThenSucceeds(Token)
-    }
-
-    private let behaviour: Behaviour
-    private var callCount = 0
-
-    public init(_ behaviour: Behaviour) {
-        self.behaviour = behaviour
-    }
-
-    public func currentValidToken() async throws -> Token {
-        callCount += 1
-        switch behaviour {
-        case .success(let token):
-            return token
-        case .failure(let error):
-            throw error
-        case .expiresThenSucceeds(let token):
-            if callCount == 1 { throw SessionError.tokenRefreshFailed }
-            return token
-        }
     }
 }

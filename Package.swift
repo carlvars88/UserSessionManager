@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "SessionManager",
     platforms: [
-        .macOS(.v11),
+        .macOS(.v12),
         .iOS(.v16)
     ],
     products: [
@@ -16,12 +16,19 @@ let package = Package(
         .library(
             name: "IdentityProviders",
             targets: ["IdentityProviders"]),
+        .library(
+            name: "SessionManagerExamples",
+            targets: ["SessionManagerExamples"]),
     ],
+    dependencies: [],
     targets: [
         .target(
             name: "SessionManager"),
         .target(
             name: "IdentityProviders",
+            dependencies: ["SessionManager"]),
+        .target(
+            name: "SessionManagerExamples",
             dependencies: ["SessionManager"]),
         .testTarget(
             name: "SessionManagerTests",
