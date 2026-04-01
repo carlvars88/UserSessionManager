@@ -24,6 +24,10 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
     public var simulatedLatency: Duration
     public var shouldFailSignIn: Bool
     public var shouldFailRefresh: Bool
+    /// Error thrown when `shouldFailRefresh` is true.
+    /// Defaults to `.invalidCredentials` (permanent — server rejected the token).
+    /// Set to `.timeout` / `.providerError` / etc. to simulate a transient failure.
+    public var refreshError: SessionError
     public var fixedUser: SessionUser
     public var tokenLifetime: TimeInterval
 
@@ -31,6 +35,7 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
         simulatedLatency: Duration    = .milliseconds(600),
         shouldFailSignIn: Bool        = false,
         shouldFailRefresh: Bool       = false,
+        refreshError: SessionError    = .invalidCredentials,
         fixedUser: SessionUser        = SessionUser(
             id: "mock-001",
             displayName: "Jane Doe",
@@ -41,6 +46,7 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
         self.simulatedLatency  = simulatedLatency
         self.shouldFailSignIn  = shouldFailSignIn
         self.shouldFailRefresh = shouldFailRefresh
+        self.refreshError      = refreshError
         self.fixedUser         = fixedUser
         self.tokenLifetime     = tokenLifetime
     }
@@ -54,9 +60,9 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
         return makeResult()
     }
 
-    public func refreshToken(_ token: BearerToken) async throws -> AuthResult<BearerToken> {
+    public func refreshToken(_ token: BearerToken, currentUser: SessionUser?) async throws -> AuthResult<BearerToken> {
         try await Task.sleep(for: simulatedLatency)
-        guard !shouldFailRefresh else { throw SessionError.tokenRefreshFailed }
+        guard !shouldFailRefresh else { throw refreshError }
         return makeResult()
     }
 
@@ -64,7 +70,9 @@ public final class MockIdentityProvider: IdentityProvider, @unchecked Sendable {
         try await Task.sleep(for: .milliseconds(100))
     }
 
-    public func currentToken() async -> BearerToken? { nil }
+    public var nativeToken: BearerToken? = nil
+
+    public func currentToken() async -> BearerToken? { nativeToken }
 
     private func makeResult() -> AuthResult<BearerToken> {
         AuthResult(
@@ -109,7 +117,7 @@ public final class MockOpaqueProvider: IdentityProvider, @unchecked Sendable {
     }
 
     // Opaque tokens have no refresh — a failed refresh means re-login
-    public func refreshToken(_ token: OpaqueSessionToken) async throws -> AuthResult<OpaqueSessionToken> {
+    public func refreshToken(_ token: OpaqueSessionToken, currentUser: SessionUser?) async throws -> AuthResult<OpaqueSessionToken> {
         throw SessionError.tokenRefreshFailed
     }
 

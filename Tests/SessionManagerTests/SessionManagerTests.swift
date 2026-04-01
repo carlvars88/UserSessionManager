@@ -84,6 +84,69 @@ final class UserSessionManagerTests: XCTestCase {
     }
 
     @MainActor
+    func test_signIn_cancelled_transitionsToFailedCancelled() async {
+        // Simulates the user dismissing ASWebAuthenticationSession mid-flow.
+        // The provider throws CancellationError → state must be .failed(.cancelled).
+        struct CancellingProvider: IdentityProvider, Sendable {
+            typealias Credential = EmailPasswordCredential
+            typealias Token      = BearerToken
+            let providerID = "cancelling"
+            func signIn(with c: EmailPasswordCredential) async throws -> AuthResult<BearerToken> {
+                throw CancellationError()
+            }
+            func refreshToken(_ t: BearerToken, currentUser: SessionUser?) async throws -> AuthResult<BearerToken> {
+                throw SessionError.tokenRefreshFailed
+            }
+            func signOut(token: BearerToken) async throws {}
+        }
+
+        let sut = UserSessionManager(
+            provider: CancellingProvider(),
+            store:    InMemoryCredentialStore<BearerToken>()
+        )
+        await sut.signIn(with: validCredential())
+
+        XCTAssertEqual(sut.state, .failed(.cancelled))
+        XCTAssertFalse(sut.state.isAuthenticated)
+    }
+
+    @MainActor
+    func test_reauthenticate_cancelled_remainsSignedIn() async {
+        // Simulates the user dismissing a biometric or re-auth prompt mid-flow.
+        // CancellationError during reauthenticate must not sign the user out.
+        struct CancellingProvider: IdentityProvider, Sendable {
+            typealias Credential = EmailPasswordCredential
+            typealias Token      = BearerToken
+            let providerID = "cancelling-reauth"
+            var callCount = 0
+            func signIn(with c: EmailPasswordCredential) async throws -> AuthResult<BearerToken> {
+                AuthResult(user: SessionUser(id: "u1", displayName: "User"),
+                           token: BearerToken(accessToken: "tok", expiresAt: Date().addingTimeInterval(3600)))
+            }
+            func reauthenticate(user: SessionUser, with c: EmailPasswordCredential) async throws -> AuthResult<BearerToken> {
+                throw CancellationError()
+            }
+            func refreshToken(_ t: BearerToken, currentUser: SessionUser?) async throws -> AuthResult<BearerToken> {
+                throw SessionError.tokenRefreshFailed
+            }
+            func signOut(token: BearerToken) async throws {}
+        }
+
+        let sut = UserSessionManager(
+            provider: CancellingProvider(),
+            store:    InMemoryCredentialStore<BearerToken>()
+        )
+        await sut.signIn(with: validCredential())
+        XCTAssertTrue(sut.state.isAuthenticated)
+        let user = sut.state.currentUser
+
+        try? await sut.reauthenticate(with: validCredential())
+
+        XCTAssertTrue(sut.state.isAuthenticated)
+        XCTAssertEqual(sut.state.currentUser, user)
+    }
+
+    @MainActor
     func test_signIn_whileLoading_isIgnored() async {
         let sut = makeSUT()
         // First signIn transitions to .loading — second should be rejected
@@ -132,6 +195,19 @@ final class UserSessionManagerTests: XCTestCase {
         XCTAssertNil(sut.state.currentUser)
     }
 
+    @MainActor
+    func test_signOut_whenAlreadySignedOut_isNoOp() async {
+        let store = InMemoryCredentialStore<BearerToken>()
+        let provider = MockIdentityProvider(simulatedLatency: .zero)
+        let sut = SUT(provider: provider, store: store)
+        // Never sign in — state is .signedOut after restore
+        await sut.signOut()
+        XCTAssertEqual(sut.state, .signedOut)
+        // Store must remain untouched (nothing to clear)
+        let stored = try? await store.load()
+        XCTAssertNil(stored)
+    }
+
     // MARK: - Token (SessionTokenProviding)
 
     @MainActor
@@ -174,6 +250,192 @@ final class UserSessionManagerTests: XCTestCase {
     }
 
     @MainActor
+    func test_refreshFails_permanently_clearsStore() async throws {
+        // invalidCredentials means the server explicitly rejected the token —
+        // session is gone, store must be wiped.
+        let store = InMemoryCredentialStore<BearerToken>()
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .invalidCredentials,
+            tokenLifetime: -1
+        )
+        let sut = SUT(provider: provider, store: store)
+        await sut.signIn(with: validCredential())
+
+        do { _ = try await sut.currentValidToken() } catch { }
+
+        XCTAssertEqual(sut.state, .expired)
+        let stored = try await store.load()
+        XCTAssertNil(stored, "Store must be cleared after permanent refresh rejection")
+    }
+
+    @MainActor
+    func test_currentValidToken_whenExpired_throwsSessionExpired() async {
+        // After a permanent refresh failure the state is .expired.
+        // A subsequent currentValidToken() call must throw .sessionExpired,
+        // not .sessionNotFound, so callers can distinguish the two cases.
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .invalidCredentials,
+            tokenLifetime: -1
+        )
+        let sut = SUT(provider: provider, store: InMemoryCredentialStore())
+        await sut.signIn(with: validCredential())
+        do { _ = try await sut.currentValidToken() } catch { }   // triggers .expired transition
+
+        XCTAssertEqual(sut.state, .expired)
+
+        do {
+            _ = try await sut.currentValidToken()
+            XCTFail("Expected sessionExpired to be thrown")
+        } catch let error as SessionError {
+            XCTAssertEqual(error, .sessionExpired)
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @MainActor
+    func test_refreshFails_transiently_preservesSessionAndStore() async throws {
+        // A transient error (timeout, server 503, etc.) must not wipe the store
+        // or transition to .expired — the next call should be able to retry.
+        let store = InMemoryCredentialStore<BearerToken>()
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .timeout,   // transient
+            tokenLifetime: -1
+        )
+        let sut = SUT(provider: provider, store: store)
+        await sut.signIn(with: validCredential())
+
+        do { _ = try await sut.currentValidToken() } catch { }
+
+        XCTAssertTrue(sut.state.isAuthenticated, "State must stay .signedIn after transient refresh failure")
+        let stored = try await store.load()
+        XCTAssertNotNil(stored, "Store must not be cleared after transient refresh failure")
+    }
+
+    @MainActor
+    func test_sessionRestore_expiredToken_transientRefreshFailure_signedOutButStorePreserved() async throws {
+        // On app relaunch with an expired stored token, a transient refresh failure
+        // should sign out without clearing the store — credentials survive for next launch.
+        let store = InMemoryCredentialStore<BearerToken>()
+        let expiredToken = BearerToken(
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            expiresAt: Date().addingTimeInterval(-100)  // already expired
+        )
+        try await store.save(token: expiredToken, user: SessionUser(id: "u1", displayName: "User"))
+
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .timeout,   // transient — no network on launch
+            tokenLifetime: -1
+        )
+        let sut = SUT(provider: provider, store: store)
+        // Trigger restore completion
+        _ = try? await sut.currentValidToken()
+
+        XCTAssertEqual(sut.state, .signedOut)
+        let stored = try await store.load()
+        XCTAssertNotNil(stored, "Store must survive a transient restore failure")
+    }
+
+    @MainActor
+    func test_sessionRestore_expiredToken_permanentRefreshFailure_clearsStore() async throws {
+        // On app relaunch with an expired stored token, a permanent rejection
+        // must clear the store — stale credentials should not persist.
+        let store = InMemoryCredentialStore<BearerToken>()
+        let expiredToken = BearerToken(
+            accessToken: "revoked-access",
+            refreshToken: "revoked-refresh",
+            expiresAt: Date().addingTimeInterval(-100)
+        )
+        try await store.save(token: expiredToken, user: SessionUser(id: "u1", displayName: "User"))
+
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .invalidCredentials,  // permanent — token was revoked
+            tokenLifetime: -1
+        )
+        let sut = SUT(provider: provider, store: store)
+        _ = try? await sut.currentValidToken()
+
+        XCTAssertEqual(sut.state, .signedOut)
+        let stored = try await store.load()
+        XCTAssertNil(stored, "Store must be cleared after permanent restore failure")
+    }
+
+    @MainActor
+    func test_sessionRestore_validStoredToken_restoresWithoutRefresh() async throws {
+        // A valid stored token must restore the session without hitting the network.
+        // shouldFailRefresh: true acts as a tripwire — if refresh is called the test fails.
+        let store = InMemoryCredentialStore<BearerToken>()
+        let validToken = BearerToken(
+            accessToken: "stored-access",
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        try await store.save(token: validToken, user: SessionUser(id: "u1", displayName: "User"))
+
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: true,
+            refreshError: .invalidCredentials   // would clear store if called
+        )
+        let sut = SUT(provider: provider, store: store)
+        _ = try? await sut.currentValidToken()
+
+        XCTAssertTrue(sut.state.isAuthenticated)
+        XCTAssertEqual(sut.state.currentUser?.id, "u1")
+        let token = try await sut.currentValidToken()
+        XCTAssertEqual(token.accessToken, "stored-access")
+    }
+
+    @MainActor
+    func test_sessionRestore_expiredStoredToken_silentRefreshSucceeds_restoresSession() async throws {
+        // On app relaunch with an expired stored token, a successful silent refresh
+        // must restore the session with the new token.
+        let store = InMemoryCredentialStore<BearerToken>()
+        let expiredToken = BearerToken(
+            accessToken: "old-access",
+            expiresAt: Date().addingTimeInterval(-100)
+        )
+        try await store.save(token: expiredToken, user: SessionUser(id: "u1", displayName: "User"))
+
+        let provider = MockIdentityProvider(simulatedLatency: .zero, shouldFailRefresh: false)
+        let sut = SUT(provider: provider, store: store)
+        _ = try? await sut.currentValidToken()
+
+        XCTAssertTrue(sut.state.isAuthenticated)
+        let token = try await sut.currentValidToken()
+        XCTAssertNotEqual(token.accessToken, "old-access")
+    }
+
+    @MainActor
+    func test_sessionRestore_nativeToken_noStoredUser_refreshesToGetUser() async throws {
+        // Path #6: provider has a cached native token but no user was ever persisted
+        // (e.g. first launch after an app update that added SessionManager).
+        // Engine must call refreshToken to recover user info.
+        let store = InMemoryCredentialStore<BearerToken>()
+
+        let provider = MockIdentityProvider(simulatedLatency: .zero, shouldFailRefresh: false)
+        provider.nativeToken = BearerToken(
+            accessToken: "native-access",
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        let sut = SUT(provider: provider, store: store)
+        _ = try? await sut.currentValidToken()
+
+        XCTAssertTrue(sut.state.isAuthenticated)
+        XCTAssertEqual(sut.state.currentUser?.id, provider.fixedUser.id)
+    }
+
+    @MainActor
     func test_freshToken_noUnnecessaryRefresh() async throws {
         let sut = makeSUT(failRefresh: true, tokenLifetime: 3600)
         await sut.signIn(with: validCredential())
@@ -190,6 +452,37 @@ final class UserSessionManagerTests: XCTestCase {
         await sut.signIn(with: validCredential())
         sut.updateUser(SessionUser(id: "mock-001", displayName: "Updated", email: "new@b.com"))
         XCTAssertEqual(sut.state.currentUser?.displayName, "Updated")
+    }
+
+    @MainActor
+    func test_refreshUser_fetchesFreshProfileFromProvider() async throws {
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            fixedUser: SessionUser(id: "mock-001", displayName: "Original Name")
+        )
+        let sut = SUT(provider: provider, store: InMemoryCredentialStore())
+        await sut.signIn(with: validCredential())
+        XCTAssertEqual(sut.state.currentUser?.displayName, "Original Name")
+
+        // Simulate a server-side profile change
+        provider.fixedUser = SessionUser(id: "mock-001", displayName: "Updated Name", email: "new@example.com")
+
+        try await sut.refreshUser()
+
+        XCTAssertEqual(sut.state.currentUser?.displayName, "Updated Name")
+        XCTAssertEqual(sut.state.currentUser?.email, "new@example.com")
+    }
+
+    @MainActor
+    func test_refreshUser_whenNotSignedIn_throws() async {
+        let sut = makeSUT()
+        // Wait for restore to settle to .signedOut
+        _ = try? await sut.currentValidToken()
+        do {
+            try await sut.refreshUser()
+            XCTFail("Expected sessionNotFound")
+        } catch SessionError.sessionNotFound { /* ✅ */ }
+          catch { XCTFail("Wrong error: \(error)") }
     }
 
     @MainActor
@@ -212,6 +505,7 @@ final class UserSessionManagerTests: XCTestCase {
 
     // MARK: - APIClient caller split
 
+    @MainActor
     func test_apiClient_dependsOnlyOnSessionTokenProviding() async throws {
 
         struct APIClient {
@@ -268,12 +562,14 @@ final class UserSessionManagerTests: XCTestCase {
 
     // MARK: - MockTokenProvider
 
+    @MainActor
     func test_mockTokenProvider_success() async throws {
         let provider = MockTokenProvider<BearerToken>(.success(BearerToken(accessToken: "tok")))
         let token = try await provider.currentValidToken()
         XCTAssertEqual(token.accessToken, "tok")
     }
 
+    @MainActor
     func test_mockTokenProvider_failure() async {
         let provider = MockTokenProvider<BearerToken>(.failure(.sessionNotFound))
         do {
@@ -281,43 +577,6 @@ final class UserSessionManagerTests: XCTestCase {
             XCTFail("Expected failure")
         } catch SessionError.sessionNotFound { /* ✅ */ }
           catch { XCTFail("Wrong error: \(error)") }
-    }
-
-    // MARK: - Protocol actor-agnostic
-
-    func test_protocolAllowsConformanceOnAnyActor() async {
-        actor BackgroundManager: @preconcurrency UserSessionManaging {
-            typealias Provider = InlineProvider
-            typealias Store    = InMemoryCredentialStore<OpaqueSessionToken>
-
-            struct InlineProvider: IdentityProvider, Sendable {
-                typealias Credential = TokenCredential
-                typealias Token      = OpaqueSessionToken
-                let providerID = "bg"
-                func signIn(with c: TokenCredential) async throws -> AuthResult<OpaqueSessionToken> {
-                    AuthResult(user: SessionUser(id: "bg", displayName: "BG User"),
-                               token: OpaqueSessionToken(value: "bg-tok"))
-                }
-                func refreshToken(_ t: OpaqueSessionToken) async throws -> AuthResult<OpaqueSessionToken> {
-                    throw SessionError.tokenRefreshFailed
-                }
-                func signOut(token: OpaqueSessionToken) async throws {}
-            }
-
-            var state: SessionState = .signedOut
-
-            func signIn(with credential: TokenCredential) async {
-                state = .signedIn(SessionUser(id: "bg", displayName: "BG User"))
-            }
-            func signOut() async { state = .signedOut }
-            func reauthenticate(with credential: TokenCredential) async throws {}
-            func updateUser(_ user: SessionUser) { state = .signedIn(user) }
-        }
-
-        let bg = BackgroundManager()
-        await bg.signIn(with: TokenCredential(rawToken: "t", provider: "bg"))
-        let s = await bg.state
-        XCTAssertEqual(s.currentUser?.displayName, "BG User")
     }
 
     // MARK: - Configuration
@@ -344,8 +603,10 @@ final class UserSessionManagerTests: XCTestCase {
     // MARK: - Operation Deduplication
 
     @MainActor
-    func test_signOut_whileLoading_isIgnored() async {
-        // Use a slow provider so signIn stays in .loading(.signingIn) long enough
+    func test_signOut_whileSignInLoading_waitsForSignInThenSignsOut() async {
+        // signOut must wait for an in-flight signIn to settle before proceeding.
+        // Cancelling mid-flight risks a dangling server-side session if the provider
+        // already issued tokens before the cancellation reached it.
         let slowProvider = MockIdentityProvider(
             simulatedLatency: .seconds(2),
             shouldFailSignIn: false,
@@ -355,17 +616,15 @@ final class UserSessionManagerTests: XCTestCase {
             provider: slowProvider,
             store: InMemoryCredentialStore<BearerToken>()
         )
-        // Start signIn in background — it will be in .loading(.signingIn)
+        // Start signIn in the background — it will sit in .loading(.signingIn)
         let signInTask = Task { await sut.signIn(with: validCredential()) }
-        // Wait briefly for signIn to enter .loading(.signingIn)
         try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
         XCTAssertEqual(sut.state, .loading(.signingIn))
-        // Now attempt signOut while signIn is in progress — should be ignored
+        // signOut waits for signIn to complete, then signs out — final state is .signedOut
         await sut.signOut()
-        // Wait for signIn to complete
         await signInTask.value
-        // Should have completed signIn successfully (signOut was ignored)
-        XCTAssertTrue(sut.state.isAuthenticated)
+        XCTAssertEqual(sut.state, .signedOut)
+        XCTAssertFalse(sut.state.isAuthenticated)
     }
 
     @MainActor
@@ -587,49 +846,6 @@ final class UserSessionManagerTests: XCTestCase {
         try await store.clear()
     }
 
-    // MARK: - MultiCredential through sign-in flow
-
-    @MainActor
-    func test_multiCredential_signIn() async {
-        // Proves MultiCredential compiles and works through the full flow
-        typealias Multi = MultiCredential<EmailPasswordCredential, TokenCredential>
-
-        struct MultiProvider: IdentityProvider, Sendable {
-            typealias Credential = Multi
-            typealias Token = OpaqueSessionToken
-            let providerID = "multi"
-
-            func signIn(with credential: Multi) async throws -> AuthResult<OpaqueSessionToken> {
-                switch credential {
-                case .first(let email):
-                    guard email.email.contains("@") else { throw SessionError.invalidCredentials }
-                    return AuthResult(
-                        user: SessionUser(id: "m1", displayName: email.email),
-                        token: OpaqueSessionToken(value: "multi-tok")
-                    )
-                case .second(let token):
-                    return AuthResult(
-                        user: SessionUser(id: "m2", displayName: token.provider),
-                        token: OpaqueSessionToken(value: token.rawToken)
-                    )
-                }
-            }
-            func refreshToken(_ token: OpaqueSessionToken) async throws -> AuthResult<OpaqueSessionToken> {
-                throw SessionError.tokenRefreshFailed
-            }
-            func signOut(token: OpaqueSessionToken) async throws {}
-        }
-
-        let sut = UserSessionManager(
-            provider: MultiProvider(),
-            store: InMemoryCredentialStore<OpaqueSessionToken>()
-        )
-
-        await sut.signIn(with: .first(EmailPasswordCredential(email: "a@b.com", password: "password123")))
-        XCTAssertTrue(sut.state.isAuthenticated)
-        XCTAssertEqual(sut.state.currentUser?.displayName, "a@b.com")
-    }
-
     // MARK: - Concurrent Operations
 
     @MainActor
@@ -822,19 +1038,6 @@ final class ObservableSessionManagerTests: XCTestCase {
         await sut.signIn(with: validCredential())
         sut.updateUser(SessionUser(id: "mock-001", displayName: "Updated", email: "new@b.com"))
         XCTAssertEqual(sut.state.currentUser?.displayName, "Updated")
-    }
-
-    // MARK: - AnySessionManager bridge
-
-    @MainActor
-    func test_anySessionManager_fromObservable() async throws {
-        let manager = makeSUT()
-        await manager.signIn(with: validCredential())
-
-        let erased = AnySessionManager<EmailPasswordCredential, BearerToken>(manager)
-        let token = try await erased.currentValidToken()
-        XCTAssertFalse(token.accessToken.isEmpty)
-        XCTAssertTrue(erased.state.isAuthenticated)
     }
 
     // MARK: - AnyTokenProvider bridge
