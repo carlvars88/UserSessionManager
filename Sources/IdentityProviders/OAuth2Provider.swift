@@ -1,35 +1,35 @@
 // MARK: - OAuth2Provider.swift
 //
-// A standard OAuth2 Authorization Code + PKCE identity provider
-// built on plain URLSession — no external dependencies.
-//
+// A standard OAuth2 Authorization Code + PKCE identity provider.
 // Works with any RFC 6749 / RFC 7636 compliant authorization server
 // (Auth0, Okta, Keycloak, Azure AD, custom servers, etc.).
 //
 // Usage:
 //
+//   // URLSession
 //   let provider = OAuth2Provider(
 //       configuration: .init(
 //           clientID:           "your-client-id",
 //           tokenEndpoint:      URL(string: "https://auth.example.com/oauth/token")!,
 //           revocationEndpoint: URL(string: "https://auth.example.com/oauth/revoke")!,
 //           userInfoEndpoint:   URL(string: "https://auth.example.com/userinfo")!
-//       )
+//       ),
+//       networkHandler: URLSession.shared.data(for:)
 //   )
+//
+//   // URLSession with SSL pinning
+//   let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
+//   let provider = OAuth2Provider(configuration: config, networkHandler: pinned.data(for:))
 //
 //   let session = UserSessionManager(
 //       provider: provider,
 //       store:    KeychainCredentialStore<BearerToken>()
 //   )
 //
-// Sign-in credential:
-//   Use OAuthCredential with the authorization code from your UI flow
-//   (ASWebAuthenticationSession, SFSafariViewController, etc.):
-//
+//   // Sign in with the authorization code from ASWebAuthenticationSession etc.
 //   let credential = OAuthCredential(
 //       provider:    "my-server",
 //       idToken:     authorizationCode,   // the code, not a JWT
-//       accessToken: nil,
 //       nonce:       codeVerifier         // PKCE code_verifier
 //   )
 //   await session.signIn(with: credential)
@@ -81,9 +81,9 @@ public struct OAuth2Configuration: Sendable {
     public init(
         clientID:           String,
         tokenEndpoint:      URL,
-        revocationEndpoint: URL?    = nil,
-        userInfoEndpoint:   URL?    = nil,
-        redirectURI:        String  = "",
+        revocationEndpoint: URL?     = nil,
+        userInfoEndpoint:   URL?     = nil,
+        redirectURI:        String   = "",
         additionalScopes:   [String] = []
     ) {
         self.clientID           = clientID
@@ -110,6 +110,26 @@ public struct OAuth2Configuration: Sendable {
 ///   - `refreshToken` → the OAuth2 refresh token (if granted)
 ///   - `expiresAt`    → computed from `expires_in`
 ///   - `scopes`       → granted scopes
+///
+/// Pass any `SMNetworkHandler` — `URLSession`, Alamofire, or a test stub:
+///
+/// ```swift
+/// // URLSession (default)
+/// OAuth2Provider(configuration: config, networkHandler: URLSession.shared.data(for:))
+///
+/// // SSL pinning
+/// let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
+/// OAuth2Provider(configuration: config, networkHandler: pinned.data(for:))
+///
+/// // Alamofire
+/// OAuth2Provider(configuration: config) { request in
+///     let data = try await AF.request(request).serializingData().value
+///     return (data, AF.request(request).response!)
+/// }
+///
+/// // Test stub
+/// OAuth2Provider(configuration: config) { _ in (tokenJSON, HTTPURLResponse(...)) }
+/// ```
 public final class OAuth2Provider: IdentityProvider, Sendable {
 
     public typealias Credential = OAuthCredential
@@ -117,17 +137,25 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
 
     public let providerID: String
 
-    private let config:     OAuth2Configuration
-    private let urlSession: URLSession
+    private let config:         OAuth2Configuration
+    private let networkHandler: SMNetworkHandler
 
+    /// Creates an `OAuth2Provider`.
+    ///
+    /// - Parameters:
+    ///   - configuration: OAuth2 server endpoints and client settings.
+    ///   - providerID: Label used in log messages. Defaults to `"oauth2"`.
+    ///   - networkHandler: The closure used for all network calls. Pass
+    ///     `URLSession.shared.data(for:)`, a pinned session's `data(for:)`,
+    ///     an Alamofire wrapper, or a stub for tests.
     public init(
-        configuration: OAuth2Configuration,
-        providerID:    String     = "oauth2",
-        session:       URLSession = .shared
+        configuration:  OAuth2Configuration,
+        providerID:     String           = "oauth2",
+        networkHandler: @escaping SMNetworkHandler
     ) {
-        self.config     = configuration
-        self.providerID = providerID
-        self.urlSession = session
+        self.config         = configuration
+        self.providerID     = providerID
+        self.networkHandler = networkHandler
     }
 
     // MARK: - Sign In (Authorization Code → Token Exchange)
@@ -147,8 +175,10 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             params["redirect_uri"] = config.redirectURI
         }
 
-        let data:     Data                = try await post(config.tokenEndpoint, form: params)
-        let response: OAuth2TokenResponse = try decode(data)
+        let response: OAuth2TokenResponse = try await decode(
+            OAuth2TokenResponse.self,
+            from: postRequest(config.tokenEndpoint, form: params)
+        )
         let token = mapToken(response)
         let user  = try await fetchUserInfo(accessToken: token.accessToken)
         return AuthResult(user: user, token: token)
@@ -167,11 +197,11 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             "client_id":     config.clientID,
         ]
 
-        let data:     Data                = try await post(config.tokenEndpoint, form: params)
-        let response: OAuth2TokenResponse = try decode(data)
+        let response: OAuth2TokenResponse = try await decode(
+            OAuth2TokenResponse.self,
+            from: postRequest(config.tokenEndpoint, form: params)
+        )
         let newToken = mapToken(response)
-        // Skip the userinfo round-trip when the engine already has the user cached.
-        // Only fetch when currentUser is nil (e.g. session restore with no stored user).
         let user = if let currentUser {
             currentUser
         } else {
@@ -190,7 +220,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             "client_id":       config.clientID,
             "token_type_hint": token.refreshToken != nil ? "refresh_token" : "access_token",
         ]
-        _ = try await post(revocationURL, form: params)
+        try await send(postRequest(revocationURL, form: params))
     }
 
     // MARK: - UserInfo
@@ -200,8 +230,10 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             throw SessionError.providerError("Cannot resolve user: userInfoEndpoint is not configured")
         }
 
-        let data:     Data                    = try await get(userInfoURL, bearer: accessToken)
-        let response: OAuth2UserInfoResponse  = try decode(data)
+        let response: OAuth2UserInfoResponse = try await decode(
+            OAuth2UserInfoResponse.self,
+            from: getRequest(userInfoURL, bearer: accessToken)
+        )
         guard let sub = response.sub else {
             throw SessionError.providerError("Missing subject claim")
         }
@@ -216,7 +248,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
     // MARK: - Token Mapping
 
     private func mapToken(_ r: OAuth2TokenResponse) -> BearerToken {
-        let scopes   = r.scope.map { $0.split(separator: " ").map(String.init) } ?? []
+        let scopes    = r.scope.map { $0.split(separator: " ").map(String.init) } ?? []
         let expiresAt = r.expires_in.map { Date().addingTimeInterval(TimeInterval($0)) }
         return BearerToken(
             accessToken:  r.access_token,
@@ -227,25 +259,28 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
         )
     }
 
-    // MARK: - Network helpers
+    // MARK: - Request Builders
 
-    private func post(_ url: URL, form params: [String: String]) async throws -> Data {
+    private func postRequest(_ url: URL, form params: [String: String]) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         request.httpBody = formEncode(params)
-        return try await send(request)
+        return request
     }
 
-    private func get(_ url: URL, bearer token: String) async throws -> Data {
+    private func getRequest(_ url: URL, bearer token: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        return try await send(request)
+        return request
     }
 
+    // MARK: - Network Helpers
+
+    @discardableResult
     private func send(_ request: URLRequest) async throws -> Data {
-        let (data, response) = try await urlSession.data(for: request)
+        let (data, response) = try await networkHandler(request)
         guard let http = response as? HTTPURLResponse else {
             throw SessionError.providerError("Non-HTTP response")
         }
@@ -259,7 +294,8 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
         return data
     }
 
-    private func decode<T: Decodable>(_ data: Data) throws -> T {
+    private func decode<T: Decodable>(_ type: T.Type, from request: URLRequest) async throws -> T {
+        let data = try await send(request)
         do {
             return try JSONDecoder().decode(T.self, from: data)
         } catch {
@@ -267,7 +303,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
         }
     }
 
-    // MARK: - Form encoding
+    // MARK: - Form Encoding
 
     private func formEncode(_ params: [String: String]) -> Data {
         params
@@ -281,8 +317,6 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
 // MARK: - String + application/x-www-form-urlencoded
 
 private extension String {
-    /// Percent-encodes the string per RFC 3986 for use in a form-encoded body.
-    /// Only unreserved characters (ALPHA / DIGIT / "-" / "." / "_" / "~") are left as-is.
     var formEncoded: String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
