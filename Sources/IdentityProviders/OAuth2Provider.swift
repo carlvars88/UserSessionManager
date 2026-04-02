@@ -1,7 +1,8 @@
 // MARK: - OAuth2Provider.swift
 //
 // A standard OAuth2 Authorization Code + PKCE identity provider
-// built on plain URLSession — no external dependencies.
+// built on SMNetworkClient — inject any conformer for SSL pinning,
+// logging, or test stubs.
 //
 // Works with any RFC 6749 / RFC 7636 compliant authorization server
 // (Auth0, Okta, Keycloak, Azure AD, custom servers, etc.).
@@ -17,19 +18,20 @@
 //       )
 //   )
 //
+//   // SSL pinning — conform URLSession in your app and inject a pinned instance:
+//   //   extension URLSession: SMNetworkClient {}   // add once in your app target
+//   let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
+//   let provider = OAuth2Provider(configuration: config, networkClient: pinned)
+//
 //   let session = UserSessionManager(
 //       provider: provider,
 //       store:    KeychainCredentialStore<BearerToken>()
 //   )
 //
-// Sign-in credential:
-//   Use OAuthCredential with the authorization code from your UI flow
-//   (ASWebAuthenticationSession, SFSafariViewController, etc.):
-//
+//   // Sign in with the authorization code from ASWebAuthenticationSession etc.
 //   let credential = OAuthCredential(
 //       provider:    "my-server",
 //       idToken:     authorizationCode,   // the code, not a JWT
-//       accessToken: nil,
 //       nonce:       codeVerifier         // PKCE code_verifier
 //   )
 //   await session.signIn(with: credential)
@@ -81,9 +83,9 @@ public struct OAuth2Configuration: Sendable {
     public init(
         clientID:           String,
         tokenEndpoint:      URL,
-        revocationEndpoint: URL?    = nil,
-        userInfoEndpoint:   URL?    = nil,
-        redirectURI:        String  = "",
+        revocationEndpoint: URL?     = nil,
+        userInfoEndpoint:   URL?     = nil,
+        redirectURI:        String   = "",
         additionalScopes:   [String] = []
     ) {
         self.clientID           = clientID
@@ -110,6 +112,18 @@ public struct OAuth2Configuration: Sendable {
 ///   - `refreshToken` → the OAuth2 refresh token (if granted)
 ///   - `expiresAt`    → computed from `expires_in`
 ///   - `scopes`       → granted scopes
+///
+/// Inject a custom `SMNetworkClient` for SSL pinning, logging, or tests:
+///
+/// ```swift
+/// // SSL pinning
+/// let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
+/// let provider = OAuth2Provider(configuration: config, networkClient: pinned)
+///
+/// // Test stub
+/// let stub = StubClient(data: tokenJSON, statusCode: 200)
+/// let provider = OAuth2Provider(configuration: config, networkClient: stub)
+/// ```
 public final class OAuth2Provider: IdentityProvider, Sendable {
 
     public typealias Credential = OAuthCredential
@@ -117,17 +131,26 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
 
     public let providerID: String
 
-    private let config:     OAuth2Configuration
-    private let urlSession: URLSession
+    private let config:        OAuth2Configuration
+    private let networkClient: any SMNetworkClient
 
+    /// Creates an `OAuth2Provider`.
+    ///
+    /// - Parameters:
+    ///   - configuration: OAuth2 server endpoints and client settings.
+    ///   - providerID: Label used in log messages. Defaults to `"oauth2"`.
+    ///   - networkClient: The HTTP client for all token-endpoint calls.
+    ///     Conform `URLSession` (or any type) to `SMNetworkClient` in your
+    ///     app target and pass the instance here. See `SMNetworkClient` for
+    ///     pinning, interceptor, and test-stub examples.
     public init(
         configuration: OAuth2Configuration,
-        providerID:    String     = "oauth2",
-        session:       URLSession = .shared
+        providerID:    String            = "oauth2",
+        networkClient: any SMNetworkClient
     ) {
-        self.config     = configuration
-        self.providerID = providerID
-        self.urlSession = session
+        self.config        = configuration
+        self.providerID    = providerID
+        self.networkClient = networkClient
     }
 
     // MARK: - Sign In (Authorization Code → Token Exchange)
@@ -147,8 +170,10 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             params["redirect_uri"] = config.redirectURI
         }
 
-        let data:     Data                = try await post(config.tokenEndpoint, form: params)
-        let response: OAuth2TokenResponse = try decode(data)
+        let response: OAuth2TokenResponse = try await networkClient.decode(
+            OAuth2TokenResponse.self,
+            from: postRequest(config.tokenEndpoint, form: params)
+        )
         let token = mapToken(response)
         let user  = try await fetchUserInfo(accessToken: token.accessToken)
         return AuthResult(user: user, token: token)
@@ -167,11 +192,12 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             "client_id":     config.clientID,
         ]
 
-        let data:     Data                = try await post(config.tokenEndpoint, form: params)
-        let response: OAuth2TokenResponse = try decode(data)
+        let response: OAuth2TokenResponse = try await networkClient.decode(
+            OAuth2TokenResponse.self,
+            from: postRequest(config.tokenEndpoint, form: params)
+        )
         let newToken = mapToken(response)
         // Skip the userinfo round-trip when the engine already has the user cached.
-        // Only fetch when currentUser is nil (e.g. session restore with no stored user).
         let user = if let currentUser {
             currentUser
         } else {
@@ -190,7 +216,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             "client_id":       config.clientID,
             "token_type_hint": token.refreshToken != nil ? "refresh_token" : "access_token",
         ]
-        _ = try await post(revocationURL, form: params)
+        try await networkClient.send(postRequest(revocationURL, form: params))
     }
 
     // MARK: - UserInfo
@@ -200,8 +226,10 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             throw SessionError.providerError("Cannot resolve user: userInfoEndpoint is not configured")
         }
 
-        let data:     Data                    = try await get(userInfoURL, bearer: accessToken)
-        let response: OAuth2UserInfoResponse  = try decode(data)
+        let response: OAuth2UserInfoResponse = try await networkClient.decode(
+            OAuth2UserInfoResponse.self,
+            from: getRequest(userInfoURL, bearer: accessToken)
+        )
         guard let sub = response.sub else {
             throw SessionError.providerError("Missing subject claim")
         }
@@ -216,7 +244,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
     // MARK: - Token Mapping
 
     private func mapToken(_ r: OAuth2TokenResponse) -> BearerToken {
-        let scopes   = r.scope.map { $0.split(separator: " ").map(String.init) } ?? []
+        let scopes    = r.scope.map { $0.split(separator: " ").map(String.init) } ?? []
         let expiresAt = r.expires_in.map { Date().addingTimeInterval(TimeInterval($0)) }
         return BearerToken(
             accessToken:  r.access_token,
@@ -227,44 +255,21 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
         )
     }
 
-    // MARK: - Network helpers
+    // MARK: - Request Builders
 
-    private func post(_ url: URL, form params: [String: String]) async throws -> Data {
+    private func postRequest(_ url: URL, form params: [String: String]) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         request.httpBody = formEncode(params)
-        return try await send(request)
+        return request
     }
 
-    private func get(_ url: URL, bearer token: String) async throws -> Data {
+    private func getRequest(_ url: URL, bearer token: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        return try await send(request)
-    }
-
-    private func send(_ request: URLRequest) async throws -> Data {
-        let (data, response) = try await urlSession.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw SessionError.providerError("Non-HTTP response")
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            if http.statusCode == 401 || http.statusCode == 403 {
-                throw SessionError.invalidCredentials
-            }
-            let body = String(data: data, encoding: .utf8) ?? "No body"
-            throw SessionError.providerError("HTTP \(http.statusCode): \(body)")
-        }
-        return data
-    }
-
-    private func decode<T: Decodable>(_ data: Data) throws -> T {
-        do {
-            return try JSONDecoder().decode(T.self, from: data)
-        } catch {
-            throw SessionError.providerError("Response decode failed: \(error.localizedDescription)")
-        }
+        return request
     }
 
     // MARK: - Form encoding
@@ -282,7 +287,6 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
 
 private extension String {
     /// Percent-encodes the string per RFC 3986 for use in a form-encoded body.
-    /// Only unreserved characters (ALPHA / DIGIT / "-" / "." / "_" / "~") are left as-is.
     var formEncoded: String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
