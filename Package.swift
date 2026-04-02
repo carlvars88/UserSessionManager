@@ -34,5 +34,9 @@ let package = Package(
             name: "SessionManagerTests",
             dependencies: ["SessionManager"]
         ),
+        .testTarget(
+            name: "IdentityProvidersTests",
+            dependencies: ["IdentityProviders"]
+        ),
     ]
 )
