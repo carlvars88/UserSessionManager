@@ -5,6 +5,61 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [2.0.0] - 2026-04-02
+
+### Breaking changes
+
+- **`OAuth2Provider.init`** — the `session: URLSession` parameter has been
+  replaced by `networkHandler: @escaping SMNetworkHandler` (required, no default).
+  Update call sites:
+  ```swift
+  // Before
+  OAuth2Provider(configuration: config)
+  OAuth2Provider(configuration: config, session: mySession)
+
+  // After
+  OAuth2Provider(configuration: config, networkHandler: URLSession.shared.data(for:))
+  OAuth2Provider(configuration: config, networkHandler: mySession.data(for:))
+  ```
+
+### New: `SMNetworkHandler` (`SessionManager` module)
+
+Replaces the `SMNetworkClient` protocol with a `@Sendable` async closure typealias:
+
+```swift
+public typealias SMNetworkHandler = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+```
+
+Accepts any HTTP layer without protocol conformance, retroactive conformances,
+or bridge adapters — the N-protocol ecosystem problem is avoided entirely:
+
+```swift
+// URLSession
+OAuth2Provider(configuration: config, networkHandler: URLSession.shared.data(for:))
+
+// SSL pinning
+let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
+OAuth2Provider(configuration: config, networkHandler: pinned.data(for:))
+
+// Alamofire
+OAuth2Provider(configuration: config) { try await AF.request($0).serializingData().value … }
+
+// Test stub
+OAuth2Provider(configuration: config) { _ in (mockData, mockResponse) }
+```
+
+### Tests
+
+- New `IdentityProvidersTests` target — 11 tests for `OAuth2Provider`:
+  sign-in happy path, missing nonce, 401/5xx responses, malformed JSON,
+  refresh with/without cached user, missing refresh token, sign-out with
+  and without revocation endpoint, missing userinfo endpoint
+- `ResponseSequence` actor — `@Sendable`-safe stub with per-call response
+  fixtures and call count tracking
+- Total: 82 tests
+
+---
+
 ## [1.0.0] - 2026-04-01
 
 Initial production release.
