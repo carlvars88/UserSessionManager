@@ -1,27 +1,25 @@
 // MARK: - OAuth2Provider.swift
 //
-// A standard OAuth2 Authorization Code + PKCE identity provider
-// built on SMNetworkClient — inject any conformer for SSL pinning,
-// logging, or test stubs.
-//
+// A standard OAuth2 Authorization Code + PKCE identity provider.
 // Works with any RFC 6749 / RFC 7636 compliant authorization server
 // (Auth0, Okta, Keycloak, Azure AD, custom servers, etc.).
 //
 // Usage:
 //
+//   // URLSession
 //   let provider = OAuth2Provider(
 //       configuration: .init(
 //           clientID:           "your-client-id",
 //           tokenEndpoint:      URL(string: "https://auth.example.com/oauth/token")!,
 //           revocationEndpoint: URL(string: "https://auth.example.com/oauth/revoke")!,
 //           userInfoEndpoint:   URL(string: "https://auth.example.com/userinfo")!
-//       )
+//       ),
+//       networkHandler: URLSession.shared.data(for:)
 //   )
 //
-//   // SSL pinning — conform URLSession in your app and inject a pinned instance:
-//   //   extension URLSession: SMNetworkClient {}   // add once in your app target
+//   // URLSession with SSL pinning
 //   let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
-//   let provider = OAuth2Provider(configuration: config, networkClient: pinned)
+//   let provider = OAuth2Provider(configuration: config, networkHandler: pinned.data(for:))
 //
 //   let session = UserSessionManager(
 //       provider: provider,
@@ -113,16 +111,24 @@ public struct OAuth2Configuration: Sendable {
 ///   - `expiresAt`    → computed from `expires_in`
 ///   - `scopes`       → granted scopes
 ///
-/// Inject a custom `SMNetworkClient` for SSL pinning, logging, or tests:
+/// Pass any `SMNetworkHandler` — `URLSession`, Alamofire, or a test stub:
 ///
 /// ```swift
+/// // URLSession (default)
+/// OAuth2Provider(configuration: config, networkHandler: URLSession.shared.data(for:))
+///
 /// // SSL pinning
 /// let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
-/// let provider = OAuth2Provider(configuration: config, networkClient: pinned)
+/// OAuth2Provider(configuration: config, networkHandler: pinned.data(for:))
+///
+/// // Alamofire
+/// OAuth2Provider(configuration: config) { request in
+///     let data = try await AF.request(request).serializingData().value
+///     return (data, AF.request(request).response!)
+/// }
 ///
 /// // Test stub
-/// let stub = StubClient(data: tokenJSON, statusCode: 200)
-/// let provider = OAuth2Provider(configuration: config, networkClient: stub)
+/// OAuth2Provider(configuration: config) { _ in (tokenJSON, HTTPURLResponse(...)) }
 /// ```
 public final class OAuth2Provider: IdentityProvider, Sendable {
 
@@ -131,26 +137,25 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
 
     public let providerID: String
 
-    private let config:        OAuth2Configuration
-    private let networkClient: any SMNetworkClient
+    private let config:         OAuth2Configuration
+    private let networkHandler: SMNetworkHandler
 
     /// Creates an `OAuth2Provider`.
     ///
     /// - Parameters:
     ///   - configuration: OAuth2 server endpoints and client settings.
     ///   - providerID: Label used in log messages. Defaults to `"oauth2"`.
-    ///   - networkClient: The HTTP client for all token-endpoint calls.
-    ///     Conform `URLSession` (or any type) to `SMNetworkClient` in your
-    ///     app target and pass the instance here. See `SMNetworkClient` for
-    ///     pinning, interceptor, and test-stub examples.
+    ///   - networkHandler: The closure used for all network calls. Pass
+    ///     `URLSession.shared.data(for:)`, a pinned session's `data(for:)`,
+    ///     an Alamofire wrapper, or a stub for tests.
     public init(
-        configuration: OAuth2Configuration,
-        providerID:    String            = "oauth2",
-        networkClient: any SMNetworkClient
+        configuration:  OAuth2Configuration,
+        providerID:     String           = "oauth2",
+        networkHandler: @escaping SMNetworkHandler
     ) {
-        self.config        = configuration
-        self.providerID    = providerID
-        self.networkClient = networkClient
+        self.config         = configuration
+        self.providerID     = providerID
+        self.networkHandler = networkHandler
     }
 
     // MARK: - Sign In (Authorization Code → Token Exchange)
@@ -170,7 +175,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             params["redirect_uri"] = config.redirectURI
         }
 
-        let response: OAuth2TokenResponse = try await networkClient.decode(
+        let response: OAuth2TokenResponse = try await decode(
             OAuth2TokenResponse.self,
             from: postRequest(config.tokenEndpoint, form: params)
         )
@@ -192,12 +197,11 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             "client_id":     config.clientID,
         ]
 
-        let response: OAuth2TokenResponse = try await networkClient.decode(
+        let response: OAuth2TokenResponse = try await decode(
             OAuth2TokenResponse.self,
             from: postRequest(config.tokenEndpoint, form: params)
         )
         let newToken = mapToken(response)
-        // Skip the userinfo round-trip when the engine already has the user cached.
         let user = if let currentUser {
             currentUser
         } else {
@@ -216,7 +220,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             "client_id":       config.clientID,
             "token_type_hint": token.refreshToken != nil ? "refresh_token" : "access_token",
         ]
-        try await networkClient.send(postRequest(revocationURL, form: params))
+        try await send(postRequest(revocationURL, form: params))
     }
 
     // MARK: - UserInfo
@@ -226,7 +230,7 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             throw SessionError.providerError("Cannot resolve user: userInfoEndpoint is not configured")
         }
 
-        let response: OAuth2UserInfoResponse = try await networkClient.decode(
+        let response: OAuth2UserInfoResponse = try await decode(
             OAuth2UserInfoResponse.self,
             from: getRequest(userInfoURL, bearer: accessToken)
         )
@@ -272,7 +276,34 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
         return request
     }
 
-    // MARK: - Form encoding
+    // MARK: - Network Helpers
+
+    @discardableResult
+    private func send(_ request: URLRequest) async throws -> Data {
+        let (data, response) = try await networkHandler(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SessionError.providerError("Non-HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw SessionError.invalidCredentials
+            }
+            let body = String(data: data, encoding: .utf8) ?? "No body"
+            throw SessionError.providerError("HTTP \(http.statusCode): \(body)")
+        }
+        return data
+    }
+
+    private func decode<T: Decodable>(_ type: T.Type, from request: URLRequest) async throws -> T {
+        let data = try await send(request)
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw SessionError.providerError("Response decode failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Form Encoding
 
     private func formEncode(_ params: [String: String]) -> Data {
         params
@@ -286,7 +317,6 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
 // MARK: - String + application/x-www-form-urlencoded
 
 private extension String {
-    /// Percent-encodes the string per RFC 3986 for use in a form-encoded body.
     var formEncoded: String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
