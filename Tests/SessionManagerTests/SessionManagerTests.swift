@@ -786,6 +786,40 @@ final class UserSessionManagerTests: XCTestCase {
         XCTAssertNotEqual(firstToken.accessToken, secondToken.accessToken)
     }
 
+    @MainActor
+    func test_proactiveRefresh_3sToken_1sBuffer_timerFiresEndToEnd() async throws {
+        // Token lifetime: 3 s, buffer: 1 s → timer fires at t = 2 s (3 − 1).
+        // After waiting 2.5 s we expect exactly one background refresh and a
+        // new access token — confirming the timer path runs end-to-end.
+        let provider = MockIdentityProvider(
+            simulatedLatency: .zero,
+            shouldFailRefresh: false,
+            tokenLifetime: 3
+        )
+        let sut = SUT(
+            provider: provider,
+            store: InMemoryCredentialStore<BearerToken>(),
+            configuration: SessionManagerConfiguration(
+                proactiveRefreshBuffer: 1,
+                operationTimeout: 5
+            )
+        )
+        await sut.signIn(with: validCredential())
+        XCTAssertTrue(sut.state.isAuthenticated)
+
+        let tokenBefore = try await sut.currentValidToken()
+        XCTAssertEqual(provider.refreshCallCount, 0, "No refresh should have occurred yet")
+
+        // Wait past the timer fire point (t = 2 s) with a 0.5 s margin
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+
+        XCTAssertEqual(provider.refreshCallCount, 1, "Proactive timer must have fired exactly once")
+        let tokenAfter = try await sut.currentValidToken()
+        XCTAssertNotEqual(tokenBefore.accessToken, tokenAfter.accessToken,
+                          "Token must be replaced after proactive refresh")
+        XCTAssertTrue(sut.state.isAuthenticated)
+    }
+
     // MARK: - AuthSessionToken.expiresAt protocol
 
     func test_bearerToken_expiresAt_conformsToProtocol() {
