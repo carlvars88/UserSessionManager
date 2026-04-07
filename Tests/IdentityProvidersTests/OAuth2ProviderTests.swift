@@ -63,12 +63,21 @@ private func userInfoJSON(
 
 // MARK: - Configuration helpers
 
-private func makeConfig(withUserInfo: Bool = true, withRevocation: Bool = true) -> OAuth2Configuration {
+private func makeConfig(
+    withUserInfo:              Bool   = true,
+    withRevocation:            Bool   = true,
+    withAuthorizationEndpoint: Bool   = false,
+    redirectURI:               String = "",
+    additionalScopes:          [String] = []
+) -> OAuth2Configuration {
     OAuth2Configuration(
-        clientID:           "test-client",
-        tokenEndpoint:      URL(string: "https://auth.example.com/token")!,
-        revocationEndpoint: withRevocation ? URL(string: "https://auth.example.com/revoke")! : nil,
-        userInfoEndpoint:   withUserInfo   ? URL(string: "https://auth.example.com/userinfo")! : nil
+        clientID:              "test-client",
+        authorizationEndpoint: withAuthorizationEndpoint ? URL(string: "https://auth.example.com/authorize")! : nil,
+        tokenEndpoint:         URL(string: "https://auth.example.com/token")!,
+        revocationEndpoint:    withRevocation ? URL(string: "https://auth.example.com/revoke")! : nil,
+        userInfoEndpoint:      withUserInfo   ? URL(string: "https://auth.example.com/userinfo")! : nil,
+        redirectURI:           redirectURI,
+        additionalScopes:      additionalScopes
     )
 }
 
@@ -213,6 +222,235 @@ final class OAuth2ProviderTests: XCTestCase {
 
         let calls = await seq.callCount
         XCTAssertEqual(calls, 0)
+    }
+
+    // MARK: - authorizationRequest
+
+    func test_authorizationRequest_noEndpoint_throwsProviderError() async {
+        let provider = OAuth2Provider(configuration: makeConfig(), networkHandler: { _ in fatalError() })
+        do {
+            _ = try await provider.authorizationRequest()
+            XCTFail("Expected providerError")
+        } catch SessionError.providerError { /* ✅ */ }
+          catch { XCTFail("Wrong error: \(error)") }
+    }
+
+    func test_authorizationRequest_containsRequiredPKCEParams() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: { _ in fatalError() }
+        )
+        let url   = try await provider.authorizationRequest(state: "test-state")
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+
+        func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
+
+        XCTAssertEqual(value("response_type"),         "code")
+        XCTAssertEqual(value("client_id"),             "test-client")
+        XCTAssertEqual(value("code_challenge_method"), "S256")
+        XCTAssertEqual(value("state"),                 "test-state")
+        XCTAssertNotNil(value("code_challenge"))
+    }
+
+    func test_authorizationRequest_codeChallenge_isBase64URLWithoutPadding() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: { _ in fatalError() }
+        )
+        let url       = try await provider.authorizationRequest()
+        let items     = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+        let challenge = items.first(where: { $0.name == "code_challenge" })!.value!
+
+        XCTAssertFalse(challenge.isEmpty)
+        XCTAssertFalse(challenge.contains("="), "base64url must have no padding")
+        XCTAssertFalse(challenge.contains("+"), "base64url must use - not +")
+        XCTAssertFalse(challenge.contains("/"), "base64url must use _ not /")
+    }
+
+    func test_authorizationRequest_includesRedirectURI_whenConfigured() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true, redirectURI: "myapp://callback"),
+            networkHandler: { _ in fatalError() }
+        )
+        let url   = try await provider.authorizationRequest()
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first(where: { $0.name == "redirect_uri" })?.value, "myapp://callback")
+    }
+
+    func test_authorizationRequest_omitsRedirectURI_whenEmpty() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: { _ in fatalError() }
+        )
+        let url   = try await provider.authorizationRequest()
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertNil(items.first(where: { $0.name == "redirect_uri" }))
+    }
+
+    func test_authorizationRequest_includesScopes_whenConfigured() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true, additionalScopes: ["openid", "profile", "email"]),
+            networkHandler: { _ in fatalError() }
+        )
+        let url   = try await provider.authorizationRequest()
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first(where: { $0.name == "scope" })?.value, "openid profile email")
+    }
+
+    func test_authorizationRequest_consecutiveCalls_produceDifferentChallenges() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: { _ in fatalError() }
+        )
+        let url1 = try await provider.authorizationRequest()
+        let url2 = try await provider.authorizationRequest()
+
+        func challenge(_ url: URL) -> String? {
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "code_challenge" })?.value
+        }
+        func state(_ url: URL) -> String? {
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "state" })?.value
+        }
+
+        XCTAssertNotEqual(challenge(url1), challenge(url2))
+        XCTAssertNotEqual(state(url1),     state(url2))
+    }
+
+    // MARK: - authorizationRequest — configurable parameter names
+
+    func test_authorizationRequest_usesCustomChallengeParameterNames() async throws {
+        let config = OAuth2Configuration(
+            clientID:                         "test-client",
+            authorizationEndpoint:            URL(string: "https://identity.enzona.net/oauth2/authorize")!,
+            tokenEndpoint:                    URL(string: "https://identity.enzona.net/oauth2/token")!,
+            codeChallengeParameterName:       "code_challange",
+            codeChallengeMethodParameterName: "code_challange_method"
+        )
+        let provider = OAuth2Provider(configuration: config, networkHandler: { _ in fatalError() })
+        let url      = try await provider.authorizationRequest()
+        let items    = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+
+        func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
+
+        XCTAssertNotNil(value("code_challange"),        "Typo param name must be used")
+        XCTAssertEqual(value("code_challange_method"), "S256")
+        XCTAssertNil(value("code_challenge"),           "Standard param name must not appear")
+        XCTAssertNil(value("code_challenge_method"),    "Standard param name must not appear")
+    }
+
+    func test_authorizationRequest_defaultsToRFCParameterNames() async throws {
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: { _ in fatalError() }
+        )
+        let url   = try await provider.authorizationRequest()
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+
+        func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
+
+        XCTAssertNotNil(value("code_challenge"))
+        XCTAssertEqual(value("code_challenge_method"), "S256")
+    }
+
+    // MARK: - signIn — state validation (inside protocol conformance)
+
+    func test_signIn_stateMismatch_throwsBeforeNetworkCall() async {
+        // authorizationRequest stores "expected-state"; signIn receives "wrong-state".
+        // Must throw before making any network call — zero responses stubbed.
+        let (handler, seq) = makeHandler()
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: handler
+        )
+        _ = try? await provider.authorizationRequest(state: "expected-state")
+
+        let credential = OAuthCredential(provider: "test", idToken: "code", state: "wrong-state")
+        do {
+            _ = try await provider.signIn(with: credential)
+            XCTFail("Expected providerError")
+        } catch SessionError.providerError(let msg) {
+            XCTAssertTrue(msg.contains("State mismatch"))
+        } catch { XCTFail("Wrong error: \(error)") }
+
+        let calls = await seq.callCount
+        XCTAssertEqual(calls, 0, "Network must not be reached on state mismatch")
+    }
+
+    func test_signIn_missingCallbackState_skipsValidation() async throws {
+        // enzona.net doesn't echo state — credential.state is nil, validation is skipped.
+        let (handler, _) = makeHandler(
+            (tokenJSON(), 200),
+            (userInfoJSON(), 200)
+        )
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: handler
+        )
+        _ = try? await provider.authorizationRequest(state: "generated-state")
+
+        let credential = OAuthCredential(provider: "test", idToken: "code")
+        let result = try await provider.signIn(with: credential)
+        XCTAssertEqual(result.token.accessToken, "access-tok")
+    }
+
+    func test_signIn_matchingState_succeedsAndExchangesCode() async throws {
+        let (handler, _) = makeHandler(
+            (tokenJSON(), 200),
+            (userInfoJSON(), 200)
+        )
+        let provider = OAuth2Provider(
+            configuration: makeConfig(withAuthorizationEndpoint: true),
+            networkHandler: handler
+        )
+        _ = try? await provider.authorizationRequest(state: "my-state")
+
+        let credential = OAuthCredential(provider: "test", idToken: "code", state: "my-state")
+        let result = try await provider.signIn(with: credential)
+        XCTAssertEqual(result.token.accessToken, "access-tok")
+        XCTAssertEqual(result.user.id, "user-123")
+    }
+
+    // MARK: - OAuth2 error response parsing
+
+    func test_refreshToken_invalidGrant_throwsInvalidCredentials() async {
+        // HTTP 400 + {"error":"invalid_grant"} must be permanent so the engine
+        // clears the store and transitions to .expired rather than retrying.
+        let body = #"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#
+        let (handler, _) = makeHandler((body.data(using: .utf8)!, 400))
+        let provider = OAuth2Provider(configuration: makeConfig(), networkHandler: handler)
+
+        do {
+            _ = try await provider.refreshToken(makeToken(), currentUser: nil)
+            XCTFail("Expected invalidCredentials")
+        } catch SessionError.invalidCredentials { /* ✅ permanent */ }
+          catch { XCTFail("Wrong error: \(error)") }
+    }
+
+    func test_refreshToken_invalidClient_throwsInvalidCredentials() async {
+        let body = #"{"error":"invalid_client"}"#
+        let (handler, _) = makeHandler((body.data(using: .utf8)!, 400))
+        let provider = OAuth2Provider(configuration: makeConfig(), networkHandler: handler)
+
+        do {
+            _ = try await provider.refreshToken(makeToken(), currentUser: nil)
+            XCTFail("Expected invalidCredentials")
+        } catch SessionError.invalidCredentials { /* ✅ */ }
+          catch { XCTFail("Wrong error: \(error)") }
+    }
+
+    func test_refreshToken_serverError_throwsProviderError() async {
+        // Transient server errors must not be treated as permanent.
+        let body = #"{"error":"server_error","error_description":"Internal error"}"#
+        let (handler, _) = makeHandler((body.data(using: .utf8)!, 503))
+        let provider = OAuth2Provider(configuration: makeConfig(), networkHandler: handler)
+
+        do {
+            _ = try await provider.refreshToken(makeToken(), currentUser: nil)
+            XCTFail("Expected providerError")
+        } catch SessionError.providerError { /* ✅ transient */ }
+          catch { XCTFail("Wrong error: \(error)") }
     }
 
     // MARK: - userInfoEndpoint

@@ -6,34 +6,36 @@
 //
 // Usage:
 //
-//   // URLSession
 //   let provider = OAuth2Provider(
 //       configuration: .init(
-//           clientID:           "your-client-id",
-//           tokenEndpoint:      URL(string: "https://auth.example.com/oauth/token")!,
-//           revocationEndpoint: URL(string: "https://auth.example.com/oauth/revoke")!,
-//           userInfoEndpoint:   URL(string: "https://auth.example.com/userinfo")!
+//           clientID:              "your-client-id",
+//           authorizationEndpoint: URL(string: "https://auth.example.com/authorize")!,
+//           tokenEndpoint:         URL(string: "https://auth.example.com/oauth/token")!,
+//           revocationEndpoint:    URL(string: "https://auth.example.com/oauth/revoke")!,
+//           userInfoEndpoint:      URL(string: "https://auth.example.com/userinfo")!,
+//           redirectURI:           "myapp://callback",
+//           additionalScopes:      ["openid", "profile"]
 //       ),
 //       networkHandler: URLSession.shared.data(for:)
 //   )
 //
-//   // URLSession with SSL pinning
-//   let pinned = URLSession(configuration: .default, delegate: PinningDelegate(), delegateQueue: nil)
-//   let provider = OAuth2Provider(configuration: config, networkHandler: pinned.data(for:))
+//   let session = UserSessionManager(provider: provider, store: KeychainCredentialStore<BearerToken>())
 //
-//   let session = UserSessionManager(
-//       provider: provider,
-//       store:    KeychainCredentialStore<BearerToken>()
-//   )
+//   // 1. Build the authorization URL (generates PKCE + state internally)
+//   let authURL = try await provider.authorizationRequest()
 //
-//   // Sign in with the authorization code from ASWebAuthenticationSession etc.
-//   let credential = OAuthCredential(
-//       provider:    "my-server",
-//       idToken:     authorizationCode,   // the code, not a JWT
-//       nonce:       codeVerifier         // PKCE code_verifier
-//   )
+//   // 2. Open authURL in ASWebAuthenticationSession / SFSafariViewController
+//   //    On callback, extract `code` and `state` from the redirect URL:
+//   //
+//   //      let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)
+//   //      let code          = components?.queryItems?.first(where: { $0.name == "code" })?.value ?? ""
+//   //      let returnedState = components?.queryItems?.first(where: { $0.name == "state" })?.value
+//
+//   // 3. Sign in — state is validated inside signIn before any network call
+//   let credential = OAuthCredential(provider: "my-server", idToken: code, state: returnedState)
 //   await session.signIn(with: credential)
 
+import CryptoKit
 import Foundation
 import SessionManager
 
@@ -45,6 +47,11 @@ private struct OAuth2TokenResponse: Decodable {
     let token_type:    String?
     let expires_in:    Int?
     let scope:         String?
+}
+
+private struct OAuth2ErrorResponse: Decodable {
+    let error:             String
+    let error_description: String?
 }
 
 private struct OAuth2UserInfoResponse: Decodable {
@@ -62,6 +69,10 @@ public struct OAuth2Configuration: Sendable {
     /// OAuth2 client identifier.
     public let clientID: String
 
+    /// Authorization endpoint — the browser URL that starts the OAuth2 flow.
+    /// Required to use `OAuth2Provider.authorizationRequest(state:)`.
+    public let authorizationEndpoint: URL?
+
     /// Token endpoint — POST here to exchange code for tokens.
     public let tokenEndpoint: URL
 
@@ -75,23 +86,39 @@ public struct OAuth2Configuration: Sendable {
     /// Redirect URI registered with the authorization server.
     public let redirectURI: String
 
-    /// Additional scopes to request.
+    /// Additional scopes to request (e.g. `["openid", "profile", "email"]`).
     public let additionalScopes: [String]
 
+    /// Query parameter name for the PKCE challenge sent in the authorization URL.
+    /// RFC 7636 specifies `"code_challenge"`. Set to `"code_challange"` for servers
+    /// with the common typo (e.g. enzona.net).
+    public let codeChallengeParameterName: String
+
+    /// Query parameter name for the PKCE challenge method sent in the authorization URL.
+    /// RFC 7636 specifies `"code_challenge_method"`. Set to `"code_challange_method"`
+    /// for servers with the common typo (e.g. enzona.net).
+    public let codeChallengeMethodParameterName: String
+
     public init(
-        clientID:           String,
-        tokenEndpoint:      URL,
-        revocationEndpoint: URL?     = nil,
-        userInfoEndpoint:   URL?     = nil,
-        redirectURI:        String   = "",
-        additionalScopes:   [String] = []
+        clientID:                       String,
+        authorizationEndpoint:          URL?     = nil,
+        tokenEndpoint:                  URL,
+        revocationEndpoint:             URL?     = nil,
+        userInfoEndpoint:               URL?     = nil,
+        redirectURI:                    String   = "",
+        additionalScopes:               [String] = [],
+        codeChallengeParameterName:     String   = "code_challenge",
+        codeChallengeMethodParameterName: String = "code_challenge_method"
     ) {
-        self.clientID           = clientID
-        self.tokenEndpoint      = tokenEndpoint
-        self.revocationEndpoint = revocationEndpoint
-        self.userInfoEndpoint   = userInfoEndpoint
-        self.redirectURI        = redirectURI
-        self.additionalScopes   = additionalScopes
+        self.clientID                        = clientID
+        self.authorizationEndpoint           = authorizationEndpoint
+        self.tokenEndpoint                   = tokenEndpoint
+        self.revocationEndpoint              = revocationEndpoint
+        self.userInfoEndpoint                = userInfoEndpoint
+        self.redirectURI                     = redirectURI
+        self.additionalScopes                = additionalScopes
+        self.codeChallengeParameterName      = codeChallengeParameterName
+        self.codeChallengeMethodParameterName = codeChallengeMethodParameterName
     }
 }
 
@@ -130,15 +157,21 @@ public struct OAuth2Configuration: Sendable {
 /// // Test stub
 /// OAuth2Provider(configuration: config) { _ in (tokenJSON, HTTPURLResponse(...)) }
 /// ```
-public final class OAuth2Provider: IdentityProvider, Sendable {
+public actor OAuth2Provider: IdentityProvider {
 
     public typealias Credential = OAuthCredential
     public typealias Token      = BearerToken
 
-    public let providerID: String
+    // nonisolated let satisfies the non-async protocol requirement from outside the actor.
+    public nonisolated let providerID: String
 
     private let config:         OAuth2Configuration
     private let networkHandler: SMNetworkHandler
+
+    // Pending PKCE state set by authorizationRequest, consumed by signIn.
+    // Actor isolation replaces the previous nonisolated(unsafe) + @unchecked Sendable.
+    private var pendingCodeVerifier:  String?
+    private var pendingExpectedState: String?
 
     /// Creates an `OAuth2Provider`.
     ///
@@ -158,10 +191,96 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
         self.networkHandler = networkHandler
     }
 
+    // MARK: - Authorization Request (PKCE)
+
+    /// Builds a PKCE authorization URL to open in a browser or `ASWebAuthenticationSession`.
+    ///
+    /// Generates a cryptographically random `code_verifier` and derives the
+    /// `code_challenge` via SHA-256 (S256). Both the verifier and `state` are
+    /// stored internally and consumed by the next `signIn(with:)` call — the
+    /// caller does not need to handle them directly.
+    ///
+    /// After the server redirects back, extract `code` and `state` from the
+    /// callback URL and pass them to `signIn(with:)` via `OAuthCredential`:
+    ///
+    /// ```swift
+    /// let authURL = try await provider.authorizationRequest()
+    /// // present authURL, receive callbackURL
+    /// let items         = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems
+    /// let code          = items?.first(where: { $0.name == "code" })?.value ?? ""
+    /// let returnedState = items?.first(where: { $0.name == "state" })?.value
+    /// await session.signIn(with: OAuthCredential(provider: "my-server", idToken: code, state: returnedState))
+    /// ```
+    ///
+    /// - Parameter state: Anti-CSRF token embedded in the URL. Defaults to a random UUID.
+    /// - Throws: `SessionError.providerError` if `authorizationEndpoint` is not configured.
+    public func authorizationRequest(state: String = UUID().uuidString) throws -> URL {
+        guard let authorizationEndpoint = config.authorizationEndpoint else {
+            throw SessionError.providerError("authorizationEndpoint is not configured")
+        }
+
+        let codeVerifier  = Self.generateCodeVerifier()
+        let codeChallenge = Self.codeChallenge(for: codeVerifier)
+
+        pendingCodeVerifier  = codeVerifier
+        pendingExpectedState = state
+
+        guard var components = URLComponents(url: authorizationEndpoint, resolvingAgainstBaseURL: false) else {
+            throw SessionError.providerError("Invalid authorizationEndpoint URL")
+        }
+
+        var items: [URLQueryItem] = [
+            URLQueryItem(name: "response_type",                         value: "code"),
+            URLQueryItem(name: "client_id",                             value: config.clientID),
+            URLQueryItem(name: config.codeChallengeParameterName,       value: codeChallenge),
+            URLQueryItem(name: config.codeChallengeMethodParameterName, value: "S256"),
+            URLQueryItem(name: "state",                                 value: state),
+        ]
+        if !config.redirectURI.isEmpty {
+            items.append(URLQueryItem(name: "redirect_uri", value: config.redirectURI))
+        }
+        if !config.additionalScopes.isEmpty {
+            items.append(URLQueryItem(name: "scope", value: config.additionalScopes.joined(separator: " ")))
+        }
+        components.queryItems = items
+
+        guard let url = components.url else {
+            throw SessionError.providerError("Failed to build authorization URL")
+        }
+
+        return url
+    }
+
+    // MARK: - PKCE Helpers
+
+    private static func generateCodeVerifier() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64URLEncoded()
+    }
+
+    private static func codeChallenge(for verifier: String) -> String {
+        Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncoded()
+    }
+
     // MARK: - Sign In (Authorization Code → Token Exchange)
 
     public func signIn(with credential: OAuthCredential) async throws -> AuthResult<BearerToken> {
-        guard let codeVerifier = credential.nonce else {
+        // Consume the pending PKCE state stored by authorizationRequest.
+        let storedVerifier      = pendingCodeVerifier
+        let storedExpectedState = pendingExpectedState
+        pendingCodeVerifier     = nil
+        pendingExpectedState    = nil
+
+        // State validation: if the server echoed state back it must match.
+        // Skipped when credential.state is nil (server doesn't support state).
+        if let returnedState = credential.state, returnedState != storedExpectedState {
+            throw SessionError.providerError("State mismatch — possible CSRF attack")
+        }
+
+        // Use the verifier stored by authorizationRequest, or fall back to
+        // credential.nonce for callers that manage PKCE manually.
+        guard let codeVerifier = storedVerifier ?? credential.nonce else {
             throw SessionError.invalidCredentials
         }
 
@@ -288,6 +407,19 @@ public final class OAuth2Provider: IdentityProvider, Sendable {
             if http.statusCode == 401 || http.statusCode == 403 {
                 throw SessionError.invalidCredentials
             }
+            // Try to parse an OAuth2 error body (RFC 6749 §5.2).
+            // Permanent errors map to .invalidCredentials so the engine
+            // clears the store and transitions to .expired instead of
+            // retrying indefinitely as if the failure were transient.
+            if let errorBody = try? JSONDecoder().decode(OAuth2ErrorResponse.self, from: data) {
+                switch errorBody.error {
+                case "invalid_grant", "invalid_client", "unauthorized_client":
+                    throw SessionError.invalidCredentials
+                default:
+                    let description = errorBody.error_description ?? errorBody.error
+                    throw SessionError.providerError("HTTP \(http.statusCode): \(description)")
+                }
+            }
             let body = String(data: data, encoding: .utf8) ?? "No body"
             throw SessionError.providerError("HTTP \(http.statusCode): \(body)")
         }
@@ -321,5 +453,16 @@ private extension String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         return addingPercentEncoding(withAllowedCharacters: allowed) ?? self
+    }
+}
+
+// MARK: - Data + base64url (RFC 4648 §5, no padding)
+
+private extension Data {
+    func base64URLEncoded() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }
