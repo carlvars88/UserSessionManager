@@ -71,7 +71,7 @@ public struct ObservableRootView: View {
             switch session.state {
             case .loading:
                 ProgressView("Restoring session…")
-            case .signedOut, .failed, .expired:
+            case .signedOut, .failed, .expired(_):
                 ObservableSignInView()
             case .signedIn:
                 ObservableHomeView()
@@ -110,7 +110,7 @@ public struct ObservableSignInView: View {
                     }
                 }
 
-                if case .expired = session.state {
+                if session.state.isExpired {
                     Section {
                         Text("Your session expired. Please sign in again.")
                             .foregroundStyle(.orange)

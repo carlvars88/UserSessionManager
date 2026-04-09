@@ -35,6 +35,33 @@ public struct SessionUser: Sendable, Equatable, Codable, Identifiable {
         self.avatarURL   = avatarURL
         self.metadata    = metadata
     }
+
+    /// Returns a copy of this user with the given key-value pairs merged into `metadata`.
+    /// Existing keys are overwritten; keys not present in `additions` are preserved.
+    public func adding(metadata additions: [String: String]) -> SessionUser {
+        var merged = metadata
+        merged.merge(additions) { _, new in new }
+        return SessionUser(id: id, displayName: displayName, email: email,
+                           avatarURL: avatarURL, metadata: merged)
+    }
+
+    /// Returns a copy of this user with the specified metadata keys removed.
+    public func removing(metadataKeys keys: Set<String>) -> SessionUser {
+        var updated = metadata
+        keys.forEach { updated.removeValue(forKey: $0) }
+        return SessionUser(id: id, displayName: displayName, email: email,
+                           avatarURL: avatarURL, metadata: updated)
+    }
+
+    // Custom decoder so sessions stored before `metadata` was added decode cleanly.
+    public init(from decoder: Decoder) throws {
+        let c           = try decoder.container(keyedBy: CodingKeys.self)
+        id          = try c.decode(String.self, forKey: .id)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        email       = try c.decodeIfPresent(String.self, forKey: .email)
+        avatarURL   = try c.decodeIfPresent(URL.self,    forKey: .avatarURL)
+        metadata    = (try? c.decodeIfPresent([String: String].self, forKey: .metadata)) ?? [:]
+    }
 }
 
 // MARK: - AuthSessionToken
@@ -214,9 +241,10 @@ public enum SessionState: Equatable, Sendable {
     /// The most recent auth operation failed.
     case failed(SessionError)
 
-    /// A session existed but the server permanently rejected a token refresh.
-    /// The credential store has been cleared. The user must sign in again.
-    case expired
+    /// The server permanently rejected a token refresh. The token has been
+    /// cleared but the user profile is preserved — the user must sign in again
+    /// but their identity is still known (display name, email, metadata).
+    case expired(SessionUser)
 
     // MARK: Derived helpers
 
@@ -233,14 +261,25 @@ public enum SessionState: Equatable, Sendable {
     }
 
     /// The signed-in user, or `nil` when not authenticated.
+    ///
+    /// Returns the user in both `.signedIn` and `.expired` states —
+    /// token expiry does not erase the user's identity.
     public var currentUser: SessionUser? {
-        if case .signedIn(let u) = self { return u }
-        return nil
+        switch self {
+        case .signedIn(let u), .expired(let u): return u
+        default: return nil
+        }
     }
 
     /// `true` only in the `.signedIn` state.
     public var isAuthenticated: Bool {
         if case .signedIn = self { return true }
+        return false
+    }
+
+    /// `true` only in the `.expired` state.
+    public var isExpired: Bool {
+        if case .expired = self { return true }
         return false
     }
 }

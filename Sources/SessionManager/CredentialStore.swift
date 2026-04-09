@@ -30,8 +30,26 @@ public protocol CredentialStore: Sendable {
     /// Load the persisted token and user profile, or `nil` if none exists.
     func load() async throws -> (token: Token, user: SessionUser)?
 
-    /// Remove all persisted credentials.
+    /// Remove only the persisted token, preserving the user profile.
+    ///
+    /// Called by the session manager on a permanent token refresh failure
+    /// (e.g. `invalidCredentials`). The user profile — including any provider
+    /// metadata such as a `deviceAuthCookie` — survives so it can be reused
+    /// on the next sign-in without forcing the user through setup steps again.
+    ///
+    /// The default implementation calls `clear()`, removing everything.
+    /// Override to provide split token/user lifecycle.
+    func clearToken() async throws
+
+    /// Remove all persisted credentials (token and user profile).
+    ///
+    /// Called on explicit sign-out. After this call `load()` returns `nil`.
     func clear() async throws
+}
+
+public extension CredentialStore {
+    /// Default: delegates to `clear()`. Override for split token/user lifecycle.
+    func clearToken() async throws { try await clear() }
 }
 
 // MARK: - InMemoryCredentialStore
@@ -49,20 +67,29 @@ public protocol CredentialStore: Sendable {
 /// ```
 public actor InMemoryCredentialStore<Token: AuthSessionToken>: CredentialStore {
 
-    private var stored: (token: Token, user: SessionUser)?
+    private var storedToken: Token?
+    private var storedUser:  SessionUser?
 
     public init() {}
 
     public func save(token: Token, user: SessionUser) throws {
-        stored = (token, user)
+        storedToken = token
+        storedUser  = user
     }
 
     public func load() throws -> (token: Token, user: SessionUser)? {
-        stored
+        guard let token = storedToken, let user = storedUser else { return nil }
+        return (token, user)
+    }
+
+    /// Clears only the token. The user profile is preserved for the next sign-in.
+    public func clearToken() throws {
+        storedToken = nil
     }
 
     public func clear() throws {
-        stored = nil
+        storedToken = nil
+        storedUser  = nil
     }
 }
 
@@ -70,11 +97,17 @@ public actor InMemoryCredentialStore<Token: AuthSessionToken>: CredentialStore {
 
 /// A production credential store that persists tokens in the system Keychain.
 ///
-/// Token and user are encoded together as a single JSON blob under the key
-/// `"{namespace}.session"`, making the write atomic with respect to
-/// Keychain semantics (delete-then-add). Automatically migrates from a
-/// legacy two-entry format (`"{namespace}.session.token"` +
-/// `"{namespace}.session.user"`) if detected on first load.
+/// Token and user are stored under **separate** Keychain keys:
+///   - `"{namespace}.session.token"` — cleared by `clearToken()` and `clear()`
+///   - `"{namespace}.session.user"`  — cleared only by `clear()` (explicit sign-out)
+///
+/// This split lifecycle means a permanent token refresh failure (e.g. `invalid_grant`)
+/// transitions the session to `.expired` without wiping the user profile. Provider
+/// metadata stored in `SessionUser.metadata` — such as a trusted-device cookie —
+/// therefore survives token expiry and is available on the next sign-in.
+///
+/// Automatically migrates from the previous single-blob format
+/// (`"{namespace}.session"`) on first load.
 ///
 /// ```swift
 /// // Default namespace (bundle identifier)
@@ -87,10 +120,9 @@ public actor InMemoryCredentialStore<Token: AuthSessionToken>: CredentialStore {
 /// KeychainCredentialStore<BearerToken>(accessibility: kSecAttrAccessibleAfterFirstUnlock)
 /// ```
 public actor KeychainCredentialStore<Token: AuthSessionToken>: CredentialStore {
-    private let serviceSession: String
-    // Legacy keys for migration from two-entry format
-    private let legacyServiceToken: String
-    private let legacyServiceUser:  String
+    private let serviceToken: String    // "{namespace}.session.token"
+    private let serviceUser:  String    // "{namespace}.session.user"
+    private let serviceLegacyBlob: String  // "{namespace}.session" — migration source only
     private let account:       String = "current"
     private let accessibility: CFString
     private let encoder:       JSONEncoder
@@ -102,7 +134,8 @@ public actor KeychainCredentialStore<Token: AuthSessionToken>: CredentialStore {
         qos: .userInitiated
     )
 
-    private struct StoredSession: Codable {
+    // Used only when migrating from the legacy single-blob format.
+    private struct LegacyStoredSession: Codable {
         let token: Token
         let user: SessionUser
     }
@@ -136,44 +169,50 @@ public actor KeychainCredentialStore<Token: AuthSessionToken>: CredentialStore {
             return d
         }()
     ) {
-        serviceSession      = "\(namespace).session"
-        legacyServiceToken  = "\(namespace).session.token"
-        legacyServiceUser   = "\(namespace).session.user"
+        serviceToken      = "\(namespace).session.token"
+        serviceUser       = "\(namespace).session.user"
+        serviceLegacyBlob = "\(namespace).session"
         self.accessibility  = accessibility
         self.encoder        = encoder
         self.decoder        = decoder
     }
 
     public func save(token: Token, user: SessionUser) async throws {
-        let session = StoredSession(token: token, user: user)
-        try await keychainSave(try encoder.encode(session), service: serviceSession)
+        try await keychainSave(try encoder.encode(token), service: serviceToken)
+        try await keychainSave(try encoder.encode(user),  service: serviceUser)
     }
 
     public func load() async throws -> (token: Token, user: SessionUser)? {
-        // Try atomic format first
-        if let data = try await keychainLoad(service: serviceSession) {
-            let session = try decoder.decode(StoredSession.self, from: data)
-            return (session.token, session.user)
+        // Current split format: both keys must exist.
+        if let tokenData = try await keychainLoad(service: serviceToken),
+           let userData  = try await keychainLoad(service: serviceUser) {
+            let token = try decoder.decode(Token.self,       from: tokenData)
+            let user  = try decoder.decode(SessionUser.self, from: userData)
+            return (token, user)
         }
-        // Migrate from legacy two-entry format
-        guard
-            let tokenData = try await keychainLoad(service: legacyServiceToken),
-            let userData  = try await keychainLoad(service: legacyServiceUser)
-        else { return nil }
-        let token = try decoder.decode(Token.self,       from: tokenData)
-        let user  = try decoder.decode(SessionUser.self, from: userData)
-        // Persist in new format and clean up legacy entries
-        try await save(token: token, user: user)
-        try? await keychainDelete(service: legacyServiceToken)
-        try? await keychainDelete(service: legacyServiceUser)
-        return (token, user)
+
+        // Migrate from previous single-blob format ("{namespace}.session").
+        if let blobData = try await keychainLoad(service: serviceLegacyBlob) {
+            let legacy = try decoder.decode(LegacyStoredSession.self, from: blobData)
+            try await save(token: legacy.token, user: legacy.user)
+            try? await keychainDelete(service: serviceLegacyBlob)
+            return (legacy.token, legacy.user)
+        }
+
+        return nil
+    }
+
+    /// Removes only the token key. The user profile key is preserved so
+    /// `SessionUser.metadata` (e.g. a trusted-device cookie) survives token expiry.
+    public func clearToken() async throws {
+        try await keychainDelete(service: serviceToken)
     }
 
     public func clear() async throws {
-        try await keychainDelete(service: serviceSession)
-        // Clean up legacy entries if they exist
-        try? await keychainDelete(service: legacyServiceToken)
-        try? await keychainDelete(service: legacyServiceUser)
+        try await keychainDelete(service: serviceToken)
+        try await keychainDelete(service: serviceUser)
+        // Clean up legacy blob if present (e.g. migration was never triggered)
+        try? await keychainDelete(service: serviceLegacyBlob)
     }
 
     // MARK: Keychain primitives

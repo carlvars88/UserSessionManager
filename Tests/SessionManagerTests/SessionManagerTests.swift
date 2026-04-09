@@ -245,7 +245,7 @@ final class UserSessionManagerTests: XCTestCase {
             _ = try await sut.currentValidToken()
             XCTFail("Expected tokenRefreshFailed")
         } catch {
-            XCTAssertEqual(sut.state, .expired)
+            XCTAssertTrue(sut.state.isExpired)
         }
     }
 
@@ -265,7 +265,7 @@ final class UserSessionManagerTests: XCTestCase {
 
         do { _ = try await sut.currentValidToken() } catch { }
 
-        XCTAssertEqual(sut.state, .expired)
+        XCTAssertTrue(sut.state.isExpired)
         let stored = try await store.load()
         XCTAssertNil(stored, "Store must be cleared after permanent refresh rejection")
     }
@@ -285,7 +285,7 @@ final class UserSessionManagerTests: XCTestCase {
         await sut.signIn(with: validCredential())
         do { _ = try await sut.currentValidToken() } catch { }   // triggers .expired transition
 
-        XCTAssertEqual(sut.state, .expired)
+        XCTAssertTrue(sut.state.isExpired)
 
         do {
             _ = try await sut.currentValidToken()
@@ -366,9 +366,12 @@ final class UserSessionManagerTests: XCTestCase {
         let sut = SUT(provider: provider, store: store)
         _ = try? await sut.currentValidToken()
 
-        XCTAssertEqual(sut.state, .signedOut)
+        // Token is permanently rejected — session transitions to .expired with the
+        // user preserved (identity survives token expiry; only signOut clears the user).
+        XCTAssertTrue(sut.state.isExpired)
+        XCTAssertEqual(sut.state.currentUser?.id, "u1")
         let stored = try await store.load()
-        XCTAssertNil(stored, "Store must be cleared after permanent restore failure")
+        XCTAssertNil(stored, "Token must be cleared after permanent restore failure")
     }
 
     @MainActor
@@ -538,7 +541,7 @@ final class UserSessionManagerTests: XCTestCase {
         } catch SessionError.tokenRefreshFailed { /* ✅ */ }
           catch { XCTFail("Wrong error: \(error)") }
 
-        XCTAssertEqual(sut2.state, .expired)
+        XCTAssertTrue(sut2.state.isExpired)
     }
 
     @MainActor
@@ -1102,7 +1105,7 @@ final class ObservableSessionManagerTests: XCTestCase {
             _ = try await sut.currentValidToken()
             XCTFail("Expected tokenRefreshFailed")
         } catch {
-            XCTAssertEqual(sut.state, .expired)
+            XCTAssertTrue(sut.state.isExpired)
         }
     }
 
