@@ -265,7 +265,7 @@ internal final class SessionManagerEngine<
 
     private func refreshIfNeeded() async throws {
         guard state.isAuthenticated else {
-            if case .expired = state { throw SessionError.sessionExpired }
+            if state.isExpired { throw SessionError.sessionExpired }
             throw SessionError.sessionNotFound
         }
 
@@ -283,7 +283,7 @@ internal final class SessionManagerEngine<
     func forceRefreshToken() async throws {
         await awaitRestoreIfNeeded()
         guard state.isAuthenticated else {
-            if case .expired = state { throw SessionError.sessionExpired }
+            if state.isExpired { throw SessionError.sessionExpired }
             throw SessionError.sessionNotFound
         }
 
@@ -316,11 +316,22 @@ internal final class SessionManagerEngine<
                 // errors, timeouts, and 5xx are transient — preserve the store so
                 // the next currentValidToken() call can retry without forcing re-login.
                 if case SessionError.invalidCredentials = error {
-                    await MainActor.run { self.transition(to: .expired) }
+                    await MainActor.run {
+                        // Preserve the current user in .expired — token expiry does
+                        // not erase identity. Only an explicit signOut clears the user.
+                        if let user = self.state.currentUser {
+                            self.transition(to: .expired(user))
+                        } else {
+                            self.transition(to: .signedOut)
+                        }
+                    }
                     do {
-                        try await self.store.clear()
+                        // clearToken() preserves the user profile (including provider
+                        // metadata such as a trusted-device cookie) so it is available
+                        // on the next sign-in. Only the token is invalidated.
+                        try await self.store.clearToken()
                     } catch {
-                        self.emit(.warning, "[\(self.provider.providerID)] Store clear failed after permanent refresh failure: \(error)")
+                        self.emit(.warning, "[\(self.provider.providerID)] Store clearToken failed after permanent refresh failure: \(error)")
                     }
                     self.emit(.error, "[\(self.provider.providerID)] Refresh failed permanently: \(error)")
                 } else {
@@ -345,6 +356,7 @@ internal final class SessionManagerEngine<
     // MARK: - Private — Session Restore (#2: timeout protection, #6: native token fallback)
 
     private func restoreSession() async {
+        var restoredUser: SessionUser?   // hoisted so the catch block can pass it to .expired
         do {
             // 1. Provider-native cache (e.g. Firebase SDK)
             let nativeToken: Provider.Token? = try await withOperationTimeout {
@@ -377,7 +389,8 @@ internal final class SessionManagerEngine<
             guard let stored = try await store.load() else {
                 transition(to: .signedOut); return
             }
-            cachedToken = stored.token
+            restoredUser = stored.user
+            cachedToken  = stored.token
 
             if stored.token.isExpired {
                 log.info("Stored token expired — attempting silent refresh.")
@@ -396,17 +409,25 @@ internal final class SessionManagerEngine<
             // Transient failures (network, timeout): preserve the store so the user
             // isn't forced to re-login after a momentary connectivity issue.
             if case SessionError.invalidCredentials = error {
-                log.warning("[\(self.provider.providerID)] Session restore failed permanently — clearing store.")
+                log.warning("[\(self.provider.providerID)] Session restore failed permanently — clearing token.")
                 do {
-                    try await store.clear()
+                    try await store.clearToken()
                 } catch {
-                    log.warning("[\(self.provider.providerID)] Store clear failed during restore cleanup: \(error)")
+                    log.warning("[\(self.provider.providerID)] Store clearToken failed during restore cleanup: \(error)")
+                }
+                cachedToken = nil
+                // Preserve the user in .expired if we loaded one — identity
+                // survives a permanent token failure.
+                if let user = restoredUser {
+                    transition(to: .expired(user))
+                } else {
+                    transition(to: .signedOut)
                 }
             } else {
                 log.warning("[\(self.provider.providerID)] Session restore failed (transient) — signing out without clearing store. \(error)")
+                cachedToken = nil
+                transition(to: .signedOut)
             }
-            cachedToken = nil
-            transition(to: .signedOut)
         }
     }
 
