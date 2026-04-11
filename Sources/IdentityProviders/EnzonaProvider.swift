@@ -30,8 +30,10 @@
 // Usage:
 //
 //   let provider = EnzonaProvider(
-//       clientID:       "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
-//       redirectURI:    "http://apk-callback",
+//       configuration: EnzonaConfiguration(
+//           clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
+//           redirectURI: "http://apk-callback"
+//       ),
 //       networkHandler: URLSession.shared.data(for:)
 //   )
 //
@@ -60,6 +62,53 @@
 import CryptoKit
 import Foundation
 import SessionManager
+
+// MARK: - EnzonaConfiguration
+
+/// Configuration for `EnzonaProvider`.
+public struct EnzonaConfiguration: Sendable {
+
+    /// OAuth2 client identifier registered with enzona.
+    public let clientID: String
+
+    /// Redirect URI registered with enzona (e.g. `"http://apk-callback"`).
+    /// Exposed on `EnzonaProvider.redirectURI` for use as
+    /// `ASWebAuthenticationSession.callbackURLScheme`.
+    public let redirectURI: String
+
+    /// OAuth2 scopes to request. Defaults to `["openid"]`.
+    public let scopes: [String]
+
+    /// Authorization endpoint. Defaults to the enzona production URL.
+    public let authorizationEndpoint: URL
+
+    /// Token endpoint. Defaults to the enzona production URL.
+    public let tokenEndpoint: URL
+
+    /// UserInfo endpoint. Defaults to the enzona production URL.
+    public let userInfoEndpoint: URL
+
+    /// Token revocation endpoint. Defaults to the enzona production URL.
+    public let revocationEndpoint: URL
+
+    public init(
+        clientID:              String,
+        redirectURI:           String,
+        scopes:                [String] = ["openid"],
+        authorizationEndpoint: URL = URL(string: "https://identity.enzona.net/oauth2/authorize")!,
+        tokenEndpoint:         URL = URL(string: "https://identity.enzona.net/oauth2/token")!,
+        userInfoEndpoint:      URL = URL(string: "https://identity.enzona.net/oauth2/userinfo")!,
+        revocationEndpoint:    URL = URL(string: "https://identity.enzona.net/oauth2/revoke")!
+    ) {
+        self.clientID              = clientID
+        self.redirectURI           = redirectURI
+        self.scopes                = scopes
+        self.authorizationEndpoint = authorizationEndpoint
+        self.tokenEndpoint         = tokenEndpoint
+        self.userInfoEndpoint      = userInfoEndpoint
+        self.revocationEndpoint    = revocationEndpoint
+    }
+}
 
 // MARK: - Private response shapes
 
@@ -110,20 +159,12 @@ public actor EnzonaProvider: IdentityProvider {
     public typealias Credential = OAuthCredential
     public typealias Token      = BearerToken
 
-    public nonisolated let providerID: String
-
-    // MARK: Endpoints (WSO2 / enzona)
-
-    private static let authorizationEndpoint = URL(string: "https://identity.enzona.net/oauth2/authorize")!
-    private static let tokenEndpoint         = URL(string: "https://identity.enzona.net/oauth2/token")!
-    private static let userInfoEndpoint      = URL(string: "https://identity.enzona.net/oauth2/userinfo")!
-    private static let revocationEndpoint    = URL(string: "https://identity.enzona.net/oauth2/revoke")!
+    public nonisolated let providerID:  String
+    public nonisolated let redirectURI: String  // for ASWebAuthenticationSession.callbackURLScheme
 
     // MARK: Stored state
 
-    private let clientID:       String
-    private let redirectURI:    String
-    private let scopes:         [String]
+    private let config:         EnzonaConfiguration
     private let networkHandler: SMNetworkHandler
 
     // Pending PKCE verifier stored by authorizationRequest, consumed by signIn.
@@ -134,23 +175,18 @@ public actor EnzonaProvider: IdentityProvider {
     /// Creates an `EnzonaProvider`.
     ///
     /// - Parameters:
-    ///   - clientID: OAuth2 client identifier registered with enzona.
-    ///   - redirectURI: Redirect URI registered with enzona (e.g. `"http://apk-callback"`).
-    ///   - scopes: OAuth2 scopes to request. Defaults to `["openid"]`.
+    ///   - configuration: Enzona OAuth2 endpoints and client settings.
     ///   - providerID: Label used in log messages. Defaults to `"enzona"`.
     ///   - networkHandler: Closure used for token / userinfo / revocation network calls.
     ///     Pass `URLSession.shared.data(for:)`, a pinned session, or a test stub.
     public init(
-        clientID:       String,
-        redirectURI:    String,
-        scopes:         [String]              = ["openid"],
+        configuration:  EnzonaConfiguration,
         providerID:     String                = "enzona",
         networkHandler: @escaping SMNetworkHandler
     ) {
-        self.clientID       = clientID
-        self.redirectURI    = redirectURI
-        self.scopes         = scopes
+        self.config         = configuration
         self.providerID     = providerID
+        self.redirectURI    = configuration.redirectURI
         self.networkHandler = networkHandler
     }
 
@@ -198,21 +234,21 @@ public actor EnzonaProvider: IdentityProvider {
         let codeChallenge = Self.codeChallenge(for: codeVerifier)
         pendingCodeVerifier = codeVerifier
 
-        guard var components = URLComponents(url: Self.authorizationEndpoint, resolvingAgainstBaseURL: false) else {
+        guard var components = URLComponents(url: config.authorizationEndpoint, resolvingAgainstBaseURL: false) else {
             throw SessionError.providerError("Invalid authorizationEndpoint URL")
         }
 
         var items: [URLQueryItem] = [
             URLQueryItem(name: "response_type",       value: "code"),
-            URLQueryItem(name: "client_id",           value: clientID),
+            URLQueryItem(name: "client_id",           value: config.clientID),
             URLQueryItem(name: "code_challange",       value: codeChallenge),   // enzona typo
             URLQueryItem(name: "code_challange_method", value: "S256"),          // enzona typo
         ]
-        if !redirectURI.isEmpty {
-            items.append(URLQueryItem(name: "redirect_uri", value: redirectURI))
+        if !config.redirectURI.isEmpty {
+            items.append(URLQueryItem(name: "redirect_uri", value: config.redirectURI))
         }
-        if !scopes.isEmpty {
-            items.append(URLQueryItem(name: "scope", value: scopes.joined(separator: " ")))
+        if !config.scopes.isEmpty {
+            items.append(URLQueryItem(name: "scope", value: config.scopes.joined(separator: " ")))
         }
         components.queryItems = items
 
@@ -239,16 +275,16 @@ public actor EnzonaProvider: IdentityProvider {
         var params: [String: String] = [
             "grant_type":    "authorization_code",
             "code":          credential.idToken,
-            "client_id":     clientID,
+            "client_id":     config.clientID,
             "code_verifier": codeVerifier,
         ]
-        if !redirectURI.isEmpty {
-            params["redirect_uri"] = redirectURI
+        if !config.redirectURI.isEmpty {
+            params["redirect_uri"] = config.redirectURI
         }
 
         let response: EnzonaTokenResponse = try await decode(
             EnzonaTokenResponse.self,
-            from: postRequest(Self.tokenEndpoint, form: params)
+            from: postRequest(config.tokenEndpoint, form: params)
         )
         let token = mapToken(response)
         var user  = try await fetchUserInfo(accessToken: token.accessToken)
@@ -279,12 +315,12 @@ public actor EnzonaProvider: IdentityProvider {
         let params: [String: String] = [
             "grant_type":    "refresh_token",
             "refresh_token": refreshToken,
-            "client_id":     clientID,
+            "client_id":     config.clientID,
         ]
 
         let response: EnzonaTokenResponse = try await decode(
             EnzonaTokenResponse.self,
-            from: postRequest(Self.tokenEndpoint, form: params)
+            from: postRequest(config.tokenEndpoint, form: params)
         )
         let newToken = mapToken(response)
         // currentUser already carries all metadata (including deviceAuthCookie)
@@ -304,10 +340,10 @@ public actor EnzonaProvider: IdentityProvider {
     public func signOut(token: BearerToken) async throws {
         let params: [String: String] = [
             "token":           token.refreshToken ?? token.accessToken,
-            "client_id":       clientID,
+            "client_id":       config.clientID,
             "token_type_hint": token.refreshToken != nil ? "refresh_token" : "access_token",
         ]
-        try await send(postRequest(Self.revocationEndpoint, form: params))
+        try await send(postRequest(config.revocationEndpoint, form: params))
         // Device trust is tied to the session — clear the cookie so the next
         // login always requires 2FA. The Keychain user entry (metadata) is
         // cleared by the session engine's store.clear() call.
@@ -319,7 +355,7 @@ public actor EnzonaProvider: IdentityProvider {
     private func fetchUserInfo(accessToken: String) async throws -> SessionUser {
         let response: EnzonaUserInfoResponse = try await decode(
             EnzonaUserInfoResponse.self,
-            from: getRequest(Self.userInfoEndpoint, bearer: accessToken)
+            from: getRequest(config.userInfoEndpoint, bearer: accessToken)
         )
         guard let sub = response.sub else {
             throw SessionError.providerError("Missing subject claim in userinfo response")
