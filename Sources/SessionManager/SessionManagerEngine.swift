@@ -71,6 +71,7 @@ internal final class SessionManagerEngine<
     /// Begins the initial session restore. Must be called once after init, typically
     /// by the wrapper's init (`UserSessionManager`, `ObservableSessionManager`).
     func start() {
+        guard restoreTask == nil else { return }
         restoreTask = Task { await self.restoreSession() }
     }
 
