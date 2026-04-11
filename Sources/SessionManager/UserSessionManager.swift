@@ -77,9 +77,8 @@ public final class UserSessionManager<
             store: store,
             configuration: configuration
         )
-        engine.onStateChange = { [weak self] newState in
-            self?.state = newState
-        }
+        engine.onStateChange = { [weak self] newState in self?.state = newState }
+        engine.start()
     }
 
     deinit {

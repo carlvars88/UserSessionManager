@@ -87,8 +87,10 @@ private actor BodyCapture {
 
 private func makeProvider(handler: @escaping SMNetworkHandler) -> EnzonaProvider {
     EnzonaProvider(
-        clientID:       "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
-        redirectURI:    "http://apk-callback",
+        configuration:  EnzonaConfiguration(
+            clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
+            redirectURI: "http://apk-callback"
+        ),
         networkHandler: handler
     )
 }
@@ -176,19 +178,21 @@ final class EnzonaProviderTests: XCTestCase {
 
     // MARK: deviceAuth cookie injection
 
-    func test_authorizationRequest_injectsCookieFromStorage() async throws {
-        // Seed cookie into HTTPCookieStorage (as a prior signIn would have done)
+    func test_authorizationRequest_injectsCookieFromMetadata() async throws {
+        // metadata["deviceAuthCookie"] is the source of truth for device trust.
+        // Passing a user that carries the value causes it to be written into HTTPCookieStorage
+        // so a non-ephemeral webview session picks it up automatically.
         clearCookie()
-        seedCookie("abc123")
         defer { clearCookie() }
 
-        let (handler, _) = makeHandler()
-        let provider = makeProvider(handler: handler)
-        _ = try await provider.authorizationRequest()
+        let provider = makeProvider(handler: makeHandler().0)
+        let trustedUser = SessionUser(id: "u1", displayName: "Test", email: nil,
+                                      metadata: ["deviceAuthCookie": "abc123"])
+        _ = try await provider.authorizationRequest(currentUser: trustedUser)
 
         let injected = HTTPCookieStorage.shared.cookies?
             .first { $0.name == "deviceAuth" && $0.domain.contains("enzona.net") }
-        XCTAssertNotNil(injected, "deviceAuth cookie should be in HTTPCookieStorage")
+        XCTAssertNotNil(injected, "deviceAuth cookie should be injected into HTTPCookieStorage from metadata")
         XCTAssertEqual(injected?.value, "abc123")
     }
 
@@ -205,14 +209,15 @@ final class EnzonaProviderTests: XCTestCase {
     }
 
     func test_signIn_storesCookieInUserMetadata() async throws {
-        // Simulate the server having set deviceAuth in the webview session
         clearCookie()
-        seedCookie("server-set-cookie")
         defer { clearCookie() }
 
         let (handler, _) = makeHandler((tokenJSON(), 200), (userInfoJSON(), 200))
         let provider = makeProvider(handler: handler)
         _ = try await provider.authorizationRequest()
+        // Simulate the server having set deviceAuth in the webview session
+        // (this happens AFTER authorizationRequest opens the webview, not before).
+        seedCookie("server-set-cookie")
         let result = try await provider.signIn(with: OAuthCredential(provider: "enzona", idToken: "code"))
 
         XCTAssertEqual(result.user.metadata["deviceAuthCookie"], "server-set-cookie",
@@ -258,8 +263,10 @@ final class EnzonaProviderTests: XCTestCase {
     func test_signIn_tokenRequestIncludesCodeVerifier() async throws {
         let capture = BodyCapture()
         let provider = EnzonaProvider(
-            clientID:       "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
-            redirectURI:    "http://apk-callback",
+            configuration:  EnzonaConfiguration(
+                clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
+                redirectURI: "http://apk-callback"
+            ),
             networkHandler: { request in
                 await capture.setIfNil(request.httpBody)
                 let url = request.url!
@@ -318,8 +325,10 @@ final class EnzonaProviderTests: XCTestCase {
     func test_refreshToken_sendsRefreshGrant() async throws {
         let capture = BodyCapture()
         let provider = EnzonaProvider(
-            clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
-            redirectURI: "http://apk-callback",
+            configuration:  EnzonaConfiguration(
+                clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
+                redirectURI: "http://apk-callback"
+            ),
             networkHandler: { request in
                 await capture.set(request.httpBody)
                 let url = request.url!
@@ -354,8 +363,10 @@ final class EnzonaProviderTests: XCTestCase {
     func test_signOut_sendsRevocationRequest() async throws {
         let capture = BodyCapture()
         let provider = EnzonaProvider(
-            clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
-            redirectURI: "http://apk-callback",
+            configuration: EnzonaConfiguration(
+                clientID:    "ofr3Wz9nnfZaFd18OewdZYvuTaEa",
+                redirectURI: "http://apk-callback"
+            ),
             networkHandler: { request in
                 await capture.set(request.httpBody)
                 let url = request.url!
@@ -373,31 +384,26 @@ final class EnzonaProviderTests: XCTestCase {
 
     // MARK: Device trust revocation
 
-    func test_clearDeviceAuth_removesActorStateAndCookieStorage() async throws {
+    func test_authorizationRequest_withoutDeviceCookieInMetadata_removesCookieFromStorage() async throws {
         clearCookie()
         seedCookie("trust-cookie")
 
-        let (handler, _) = makeHandler(
-            (tokenJSON(), 200),
-            (userInfoJSON(), 200)
-        )
-        let provider = makeProvider(handler: handler)
-        // signIn so actor state is populated
-        _ = try await provider.authorizationRequest()
-        _ = try await provider.signIn(with: OAuthCredential(provider: "enzona", idToken: "code"))
+        let provider = makeProvider(handler: makeHandler((tokenJSON(), 200), (userInfoJSON(), 200)).0)
 
-        await provider.clearDeviceAuth()
+        // A user with no deviceAuthCookie in metadata signals device is untrusted.
+        let userWithoutDeviceTrust = SessionUser(id: "u1", displayName: "Test", email: nil)
+        _ = try await provider.authorizationRequest(currentUser: userWithoutDeviceTrust)
 
         // HTTPCookieStorage must be cleared
         let cookie = HTTPCookieStorage.shared.cookies?
             .first { $0.name == "deviceAuth" && $0.domain.contains("enzona.net") }
-        XCTAssertNil(cookie, "deviceAuth must be removed from HTTPCookieStorage after clearDeviceAuth()")
+        XCTAssertNil(cookie, "deviceAuth must be removed from HTTPCookieStorage when metadata has no deviceAuthCookie")
 
-        // Next authorizationRequest must not re-inject the cookie
-        _ = try await provider.authorizationRequest()
+        // Subsequent authorizationRequest without metadata must not re-inject the cookie
+        _ = try await provider.authorizationRequest(currentUser: userWithoutDeviceTrust)
         let reinjected = HTTPCookieStorage.shared.cookies?
             .first { $0.name == "deviceAuth" && $0.domain.contains("enzona.net") }
-        XCTAssertNil(reinjected, "authorizationRequest must not inject cookie after clearDeviceAuth()")
+        XCTAssertNil(reinjected, "authorizationRequest must not inject cookie when metadata has no deviceAuthCookie")
     }
 
     func test_removingMetadataKeys_stripsSpecifiedKeys() {

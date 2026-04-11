@@ -79,9 +79,8 @@ public final class ObservableSessionManager<
             store: store,
             configuration: configuration
         )
-        engine.onStateChange = { [weak self] newState in
-            self?.state = newState
-        }
+        engine.onStateChange = { [weak self] newState in self?.state = newState }
+        engine.start()
     }
 
     deinit {
