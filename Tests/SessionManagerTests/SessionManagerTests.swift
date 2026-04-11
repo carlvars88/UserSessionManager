@@ -19,7 +19,7 @@ final class UserSessionManagerTests: XCTestCase {
         failRefresh:   Bool         = false,
         tokenLifetime: TimeInterval = 3600
     ) -> SUT {
-        SUT(
+        let sut = SUT(
             provider: MockIdentityProvider(
                 simulatedLatency: .zero,
                 shouldFailSignIn:  failSignIn,
@@ -28,14 +28,18 @@ final class UserSessionManagerTests: XCTestCase {
             ),
             store: InMemoryCredentialStore<BearerToken>()
         )
+        sut.restoreSession()
+        return sut
     }
 
     @MainActor
     private func makeOpaqueSUT(failSignIn: Bool = false) -> OpaqueSUT {
-        OpaqueSUT(
+        let sut = OpaqueSUT(
             provider: MockOpaqueProvider(shouldFailSignIn: failSignIn),
             store:    InMemoryCredentialStore<OpaqueSessionToken>()
         )
+        sut.restoreSession()
+        return sut
     }
 
     private func validCredential() -> EmailPasswordCredential {
@@ -104,6 +108,7 @@ final class UserSessionManagerTests: XCTestCase {
             provider: CancellingProvider(),
             store:    InMemoryCredentialStore<BearerToken>()
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
 
         XCTAssertEqual(sut.state, .failed(.cancelled))
@@ -136,6 +141,7 @@ final class UserSessionManagerTests: XCTestCase {
             provider: CancellingProvider(),
             store:    InMemoryCredentialStore<BearerToken>()
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertTrue(sut.state.isAuthenticated)
         let user = sut.state.currentUser
@@ -200,6 +206,7 @@ final class UserSessionManagerTests: XCTestCase {
         let store = InMemoryCredentialStore<BearerToken>()
         let provider = MockIdentityProvider(simulatedLatency: .zero)
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         // Never sign in — state is .signedOut after restore
         await sut.signOut()
         XCTAssertEqual(sut.state, .signedOut)
@@ -261,6 +268,7 @@ final class UserSessionManagerTests: XCTestCase {
             tokenLifetime: -1
         )
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
 
         do { _ = try await sut.currentValidToken() } catch { }
@@ -282,6 +290,7 @@ final class UserSessionManagerTests: XCTestCase {
             tokenLifetime: -1
         )
         let sut = SUT(provider: provider, store: InMemoryCredentialStore())
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         do { _ = try await sut.currentValidToken() } catch { }   // triggers .expired transition
 
@@ -309,6 +318,7 @@ final class UserSessionManagerTests: XCTestCase {
             tokenLifetime: -1
         )
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
 
         do { _ = try await sut.currentValidToken() } catch { }
@@ -337,6 +347,7 @@ final class UserSessionManagerTests: XCTestCase {
             tokenLifetime: -1
         )
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         // Trigger restore completion
         _ = try? await sut.currentValidToken()
 
@@ -364,6 +375,7 @@ final class UserSessionManagerTests: XCTestCase {
             tokenLifetime: -1
         )
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         _ = try? await sut.currentValidToken()
 
         // Token is permanently rejected — session transitions to .expired with the
@@ -391,6 +403,7 @@ final class UserSessionManagerTests: XCTestCase {
             refreshError: .invalidCredentials   // would clear store if called
         )
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         _ = try? await sut.currentValidToken()
 
         XCTAssertTrue(sut.state.isAuthenticated)
@@ -412,6 +425,7 @@ final class UserSessionManagerTests: XCTestCase {
 
         let provider = MockIdentityProvider(simulatedLatency: .zero, shouldFailRefresh: false)
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         _ = try? await sut.currentValidToken()
 
         XCTAssertTrue(sut.state.isAuthenticated)
@@ -432,6 +446,7 @@ final class UserSessionManagerTests: XCTestCase {
             expiresAt: Date().addingTimeInterval(3600)
         )
         let sut = SUT(provider: provider, store: store)
+        sut.restoreSession()
         _ = try? await sut.currentValidToken()
 
         XCTAssertTrue(sut.state.isAuthenticated)
@@ -464,6 +479,7 @@ final class UserSessionManagerTests: XCTestCase {
             fixedUser: SessionUser(id: "mock-001", displayName: "Original Name")
         )
         let sut = SUT(provider: provider, store: InMemoryCredentialStore())
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertEqual(sut.state.currentUser?.displayName, "Original Name")
 
@@ -497,6 +513,7 @@ final class UserSessionManagerTests: XCTestCase {
         // forceRefreshToken() must call the provider regardless.
         let provider = MockIdentityProvider(simulatedLatency: .zero, tokenLifetime: 3600)
         let sut = SUT(provider: provider, store: InMemoryCredentialStore<BearerToken>())
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertTrue(sut.isAuthenticated)
         XCTAssertEqual(provider.refreshCallCount, 0)
@@ -532,6 +549,7 @@ final class UserSessionManagerTests: XCTestCase {
             refreshError: .invalidCredentials
         )
         let sut2 = SUT(provider: provider, store: InMemoryCredentialStore<BearerToken>())
+        sut2.restoreSession()
         await sut2.signIn(with: validCredential())
         provider.shouldFailRefresh = true
 
@@ -577,10 +595,11 @@ final class UserSessionManagerTests: XCTestCase {
         }
 
         // 1. Real manager
-        let manager = await UserSessionManager(
+        let manager = UserSessionManager(
             provider: MockIdentityProvider(simulatedLatency: .zero),
             store:    InMemoryCredentialStore<BearerToken>()
         )
+        manager.restoreSession()
         await manager.signIn(with: EmailPasswordCredential(email: "a@b.com", password: "pass123"))
         let header = try await APIClient(tokens: manager).authorizationHeader()
         XCTAssertTrue(header.hasPrefix("Bearer mock-access-"))
@@ -595,11 +614,13 @@ final class UserSessionManagerTests: XCTestCase {
 
     // MARK: - AnyTokenProvider
 
+    @MainActor
     func test_anyTokenProvider_bearer_extractsAccessToken() async throws {
-        let manager = await UserSessionManager(
+        let manager = UserSessionManager(
             provider: MockIdentityProvider(simulatedLatency: .zero),
             store:    InMemoryCredentialStore<BearerToken>()
         )
+        manager.restoreSession()
         await manager.signIn(with: EmailPasswordCredential(email: "a@b.com", password: "pass123"))
         let anyProvider = AnyTokenProvider(manager)
         let raw = try await anyProvider.currentRawToken()
@@ -607,11 +628,13 @@ final class UserSessionManagerTests: XCTestCase {
         XCTAssertTrue(raw!.hasPrefix("mock-access-"))
     }
 
+    @MainActor
     func test_anyTokenProvider_opaque_extractsValue() async throws {
-        let manager = await UserSessionManager(
+        let manager = UserSessionManager(
             provider: MockOpaqueProvider(),
             store:    InMemoryCredentialStore<OpaqueSessionToken>()
         )
+        manager.restoreSession()
         await manager.signIn(with: EmailPasswordCredential(email: "a@b.com", password: "pass123"))
         let anyProvider = AnyTokenProvider(manager)
         let raw = try await anyProvider.currentRawToken()
@@ -648,6 +671,7 @@ final class UserSessionManagerTests: XCTestCase {
             store: InMemoryCredentialStore<BearerToken>(),
             configuration: config
         )
+        sut.restoreSession()
         XCTAssertEqual(sut.configuration.proactiveRefreshBuffer, 120)
         XCTAssertEqual(sut.configuration.operationTimeout, 10)
     }
@@ -675,6 +699,7 @@ final class UserSessionManagerTests: XCTestCase {
             provider: slowProvider,
             store: InMemoryCredentialStore<BearerToken>()
         )
+        sut.restoreSession()
         // Start signIn in the background — it will sit in .loading(.signingIn)
         let signInTask = Task { await sut.signIn(with: validCredential()) }
         try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
@@ -740,6 +765,7 @@ final class UserSessionManagerTests: XCTestCase {
             store: InMemoryCredentialStore<BearerToken>(),
             configuration: SessionManagerConfiguration(operationTimeout: 0.1)
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
 
         guard case .failed(let error) = sut.state else {
@@ -755,6 +781,7 @@ final class UserSessionManagerTests: XCTestCase {
             store: InMemoryCredentialStore<BearerToken>(),
             configuration: SessionManagerConfiguration(operationTimeout: nil)
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertTrue(sut.state.isAuthenticated)
     }
@@ -776,6 +803,7 @@ final class UserSessionManagerTests: XCTestCase {
                 operationTimeout: 5
             )
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertTrue(sut.state.isAuthenticated)
 
@@ -807,6 +835,7 @@ final class UserSessionManagerTests: XCTestCase {
                 operationTimeout: 5
             )
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertTrue(sut.state.isAuthenticated)
 
@@ -982,6 +1011,7 @@ final class UserSessionManagerTests: XCTestCase {
                 operationTimeout: 5
             )
         )
+        sut.restoreSession()
         await sut.signIn(with: validCredential())
         XCTAssertTrue(sut.state.isAuthenticated)
 
@@ -1033,7 +1063,7 @@ final class ObservableSessionManagerTests: XCTestCase {
         failRefresh:   Bool         = false,
         tokenLifetime: TimeInterval = 3600
     ) -> ObservableSUT {
-        ObservableSUT(
+        let sut = ObservableSUT(
             provider: MockIdentityProvider(
                 simulatedLatency: .zero,
                 shouldFailSignIn:  failSignIn,
@@ -1042,6 +1072,8 @@ final class ObservableSessionManagerTests: XCTestCase {
             ),
             store: InMemoryCredentialStore<BearerToken>()
         )
+        sut.restoreSession()
+        return sut
     }
 
     // MARK: - Initial State
@@ -1119,6 +1151,7 @@ final class ObservableSessionManagerTests: XCTestCase {
             store: InMemoryCredentialStore<BearerToken>(),
             configuration: config
         )
+        sut.restoreSession()
         XCTAssertEqual(sut.configuration.proactiveRefreshBuffer, 120)
         XCTAssertEqual(sut.configuration.operationTimeout, 10)
     }

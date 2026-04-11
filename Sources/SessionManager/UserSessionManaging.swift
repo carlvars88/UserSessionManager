@@ -36,7 +36,9 @@ import Foundation
 ///                                                   store: KeychainCredentialStore())
 ///     var body: some Scene {
 ///         WindowGroup {
-///             ContentView().environmentObject(session)
+///             ContentView()
+///                 .environmentObject(session)
+///                 .onAppear { session.restoreSession() }
 ///         }
 ///     }
 /// }
@@ -54,6 +56,13 @@ public protocol UserSessionManaging<Provider, Store>: Sendable
     /// `error`, `currentUser`, `isAuthenticated`) are computed from this
     /// single source of truth.
     var state: SessionState { get }
+
+    /// Wires state propagation and begins restoring any previously persisted session.
+    ///
+    /// Call this once after the manager is created — typically in `onAppear` or
+    /// the entry point of your app. All subsequent methods (`signIn`, `signOut`, etc.)
+    /// await the restore before proceeding.
+    func restoreSession()
 
     /// Begin a sign-in flow with the given credential.
     ///
