@@ -13,7 +13,9 @@
 //       )
 //       var body: some Scene {
 //           WindowGroup {
-//               ObservableRootView().environment(session)
+//               ObservableRootView()
+//                   .environment(session)
+//                   .onAppear { session.restoreSession() }
 //           }
 //       }
 //   }

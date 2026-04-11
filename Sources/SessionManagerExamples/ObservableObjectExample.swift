@@ -18,6 +18,7 @@
 //           WindowGroup {
 //               ObservableObjectRootView()
 //                   .environmentObject(session)
+//                   .onAppear { session.restoreSession() }
 //           }
 //       }
 //   }

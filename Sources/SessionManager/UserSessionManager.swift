@@ -59,7 +59,9 @@ public final class UserSessionManager<
 
     // MARK: Init
 
-    /// Creates a session manager and immediately begins restoring any
+    /// Creates a session manager.
+    ///
+    /// Call ``restoreSession()`` after initialization to begin restoring any
     /// previously persisted session.
     ///
     /// - Parameters:
@@ -77,9 +79,17 @@ public final class UserSessionManager<
             store: store,
             configuration: configuration
         )
-        engine.onStateChange = { [weak self] newState in
-            self?.state = newState
-        }
+    }
+
+    /// Wires state propagation and begins restoring any previously persisted session.
+    ///
+    /// Call this once after the manager is created — typically in `onAppear` or
+    /// the entry point of your app. All public methods (`signIn`, `signOut`, etc.)
+    /// await the restore before proceeding, so it is safe to call them immediately
+    /// after this method returns without waiting for the state to leave `.loading`.
+    public func restoreSession() {
+        engine.onStateChange = { [weak self] newState in self?.state = newState }
+        engine.start()
     }
 
     deinit {
