@@ -20,17 +20,36 @@ import Foundation
 /// Conforms to `@MainActor` — `currentValidToken()` is `async`, so callers
 /// on any actor can `await` it and Swift hops to the main actor automatically.
 ///
-/// ## Typical networking usage
+/// ## Typical networking usage with 401-retry
 ///
 /// ```swift
 /// struct APIClient {
 ///     let tokens: any SessionTokenProviding<BearerToken>
 ///
 ///     func request(_ url: URL) async throws -> Data {
+///         // 1. Get a valid token (auto-refreshes if expired or near expiry).
+///         var req = try await authorized(URLRequest(url: url))
+///         var (data, response) = try await URLSession.shared.data(for: req)
+///
+///         // 2. On 401, the locally valid token was rejected server-side
+///         //    (revocation, rotation, clock skew). Force-refresh once and retry.
+///         if (response as? HTTPURLResponse)?.statusCode == 401 {
+///             try await tokens.forceRefreshToken()
+///             req = try await authorized(URLRequest(url: url))
+///             (data, response) = try await URLSession.shared.data(for: req)
+///         }
+///
+///         guard (response as? HTTPURLResponse)?.statusCode != 401 else {
+///             throw SessionError.sessionExpired
+///         }
+///         return data
+///     }
+///
+///     private func authorized(_ req: URLRequest) async throws -> URLRequest {
 ///         let token = try await tokens.currentValidToken()
-///         var req = URLRequest(url: url)
+///         var req = req
 ///         req.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
-///         return try await URLSession.shared.data(for: req).0
+///         return req
 ///     }
 /// }
 ///

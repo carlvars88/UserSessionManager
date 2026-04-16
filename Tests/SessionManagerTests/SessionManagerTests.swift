@@ -275,7 +275,8 @@ final class UserSessionManagerTests: XCTestCase {
 
         XCTAssertTrue(sut.state.isExpired)
         let stored = try await store.load()
-        XCTAssertNil(stored, "Store must be cleared after permanent refresh rejection")
+        XCTAssertNil(stored?.token, "Token must be cleared after permanent refresh rejection")
+        XCTAssertNotNil(stored?.user, "User must be preserved after permanent refresh rejection")
     }
 
     @MainActor
@@ -383,7 +384,32 @@ final class UserSessionManagerTests: XCTestCase {
         XCTAssertTrue(sut.state.isExpired)
         XCTAssertEqual(sut.state.currentUser?.id, "u1")
         let stored = try await store.load()
-        XCTAssertNil(stored, "Token must be cleared after permanent restore failure")
+        XCTAssertNil(stored?.token, "Token must be cleared after permanent restore failure")
+        XCTAssertNotNil(stored?.user, "User must be preserved after permanent restore failure")
+    }
+
+    @MainActor
+    func test_sessionRestore_afterClearToken_restoresExpiredWithUser() async throws {
+        // Regression: clearToken() preserves the user key but load() returns nil (no token).
+        // On the NEXT launch restoreSession() must call loadUser() and transition to
+        // .expired(user) rather than .signedOut — so identity is visible on re-sign-in.
+        let store = InMemoryCredentialStore<BearerToken>()
+        try await store.save(
+            token: BearerToken(accessToken: "tok", expiresAt: Date().addingTimeInterval(-1)),
+            user:  SessionUser(id: "u1", displayName: "User")
+        )
+        try await store.clearToken()   // simulate what engine does after permanent failure
+
+        // New manager — simulates a fresh app launch with the preserved user entry.
+        let sut = SUT(
+            provider: MockIdentityProvider(simulatedLatency: .zero),
+            store: store
+        )
+        sut.restoreSession()
+        _ = try? await sut.currentValidToken()   // drain restore
+
+        XCTAssertTrue(sut.state.isExpired, "Must restore to .expired, not .signedOut")
+        XCTAssertEqual(sut.state.currentUser?.id, "u1", "User identity must survive clearToken()")
     }
 
     @MainActor
@@ -900,8 +926,8 @@ final class UserSessionManagerTests: XCTestCase {
         let loaded = try await store.load()
 
         XCTAssertNotNil(loaded)
-        XCTAssertEqual(loaded?.token.accessToken, "acc")
-        XCTAssertEqual(loaded?.token.refreshToken, "ref")
+        XCTAssertEqual(loaded?.token?.accessToken, "acc")
+        XCTAssertEqual(loaded?.token?.refreshToken, "ref")
         XCTAssertEqual(loaded?.user.id, "u1")
         XCTAssertEqual(loaded?.user.displayName, "Test User")
 
@@ -917,7 +943,7 @@ final class UserSessionManagerTests: XCTestCase {
         try await store.save(token: BearerToken(accessToken: "second"), user: user)
 
         let loaded = try await store.load()
-        XCTAssertEqual(loaded?.token.accessToken, "second")
+        XCTAssertEqual(loaded?.token?.accessToken, "second")
 
         try await store.clear()
     }
@@ -948,7 +974,7 @@ final class UserSessionManagerTests: XCTestCase {
         try await store.save(token: token, user: user)
         let loaded = try await store.load()
 
-        XCTAssertEqual(loaded?.token.value, "opaque-value")
+        XCTAssertEqual(loaded?.token?.value, "opaque-value")
         XCTAssertEqual(loaded?.user.displayName, "Opaque User")
 
         try await store.clear()
@@ -962,7 +988,7 @@ final class UserSessionManagerTests: XCTestCase {
         try await store.save(token: token, user: user)
         let loaded = try await store.load()
 
-        XCTAssertEqual(loaded?.token.cookieName, "session_id")
+        XCTAssertEqual(loaded?.token?.cookieName, "session_id")
         XCTAssertEqual(loaded?.user.id, "u3")
 
         try await store.clear()

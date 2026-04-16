@@ -396,19 +396,25 @@ internal final class SessionManagerEngine<
                 transition(to: .signedOut); return
             }
             restoredUser = stored.user
-            cachedToken  = stored.token
 
-            if stored.token.isExpired {
+            // Token was cleared by a prior permanent refresh failure (clearToken preserves
+            // the user). Restore to .expired so identity is visible on the re-sign-in screen.
+            guard let token = stored.token else {
+                transition(to: .expired(stored.user)); return
+            }
+            cachedToken = token
+
+            if token.isExpired {
                 log.info("Stored token expired — attempting silent refresh.")
                 let result = try await withOperationTimeout {
-                    try await self.provider.refreshToken(stored.token, currentUser: stored.user)
+                    try await self.provider.refreshToken(token, currentUser: stored.user)
                 }
                 try await persist(result)
                 transition(to: .signedIn(result.user))
                 scheduleProactiveRefresh(for: result.token)
             } else {
                 transition(to: .signedIn(stored.user))
-                scheduleProactiveRefresh(for: stored.token)
+                scheduleProactiveRefresh(for: token)
             }
         } catch {
             // Permanent auth rejection: stored credentials are invalid — clear them.

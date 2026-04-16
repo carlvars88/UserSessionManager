@@ -27,8 +27,16 @@ public protocol CredentialStore: Sendable {
     /// Persist a token and its associated user profile atomically.
     func save(token: Token, user: SessionUser) async throws
 
-    /// Load the persisted token and user profile, or `nil` if none exists.
-    func load() async throws -> (token: Token, user: SessionUser)?
+    /// Load the persisted credentials.
+    ///
+    /// Returns a tuple with three possible outcomes:
+    /// - `nil` — no credentials exist (never signed in, or after a full `clear()`).
+    /// - `(token: nil, user: SessionUser)` — user profile is present but the token
+    ///   was cleared by a prior `clearToken()` call (e.g. permanent token rejection
+    ///   on a previous launch). The session engine transitions to `.expired(user)`.
+    /// - `(token: Token, user: SessionUser)` — full credentials; the session is
+    ///   restored directly or silently refreshed if the token is expired.
+    func load() async throws -> (token: Token?, user: SessionUser)?
 
     /// Remove only the persisted token, preserving the user profile.
     ///
@@ -77,13 +85,13 @@ public actor InMemoryCredentialStore<Token: AuthSessionToken>: CredentialStore {
         storedUser  = user
     }
 
-    public func load() throws -> (token: Token, user: SessionUser)? {
-        guard let token = storedToken, let user = storedUser else { return nil }
-        return (token, user)
+    public func load() throws -> (token: Token?, user: SessionUser)? {
+        guard let user = storedUser else { return nil }
+        return (storedToken, user)
     }
 
     /// Clears only the token. The user profile is preserved for the next sign-in.
-    public func clearToken() throws {
+    public func clearToken() async throws {
         storedToken = nil
     }
 
@@ -182,16 +190,8 @@ public actor KeychainCredentialStore<Token: AuthSessionToken>: CredentialStore {
         try await keychainSave(try encoder.encode(user),  service: serviceUser)
     }
 
-    public func load() async throws -> (token: Token, user: SessionUser)? {
-        // Current split format: both keys must exist.
-        if let tokenData = try await keychainLoad(service: serviceToken),
-           let userData  = try await keychainLoad(service: serviceUser) {
-            let token = try decoder.decode(Token.self,       from: tokenData)
-            let user  = try decoder.decode(SessionUser.self, from: userData)
-            return (token, user)
-        }
-
-        // Migrate from previous single-blob format ("{namespace}.session").
+    public func load() async throws -> (token: Token?, user: SessionUser)? {
+        // Migrate from previous single-blob format ("{namespace}.session") first.
         if let blobData = try await keychainLoad(service: serviceLegacyBlob) {
             let legacy = try decoder.decode(LegacyStoredSession.self, from: blobData)
             try await save(token: legacy.token, user: legacy.user)
@@ -199,7 +199,17 @@ public actor KeychainCredentialStore<Token: AuthSessionToken>: CredentialStore {
             return (legacy.token, legacy.user)
         }
 
-        return nil
+        // Current split format: user must exist; token is optional (cleared after permanent failure).
+        guard let userData = try await keychainLoad(service: serviceUser) else { return nil }
+        let user = try decoder.decode(SessionUser.self, from: userData)
+
+        if let tokenData = try await keychainLoad(service: serviceToken) {
+            let token = try decoder.decode(Token.self, from: tokenData)
+            return (token, user)
+        }
+
+        // User exists but token was cleared — signals .expired on restore.
+        return (nil, user)
     }
 
     /// Removes only the token key. The user profile key is preserved so
